@@ -1,0 +1,19 @@
+timestamp,question,input_tokens,output_tokens,total_tokens,model,success
+2026-03-19 21:54:58,"Tell me top 2026 customers, without walmart",259783,443,260226,gemini-2.5-pro,True
+2026-03-20 16:33:51,Top 10 customers,55910,375,56285,gemini-2.5-pro,True
+2026-03-20 16:34:48,home depot sales 2026,37614,159,37773,gemini-2.5-pro,True
+2026-03-20 16:37:53,Tell me home depot sales in 2026,38028,163,38191,gemini-2.5-pro,True
+2026-03-20 16:42:30,Tell me home depot 2026 sales,37911,225,38136,gemini-2.5-pro,True
+2026-03-20 16:45:45,Tell me home depot sale for 2026,0,0,0,gemini-2.5-pro,False
+2026-03-20 16:49:12,Tell me home depot sales for 2026,38451,192,38643,gemini-2.5-pro,True
+2026-03-20 16:53:06,costco q1 sales 2024 vs costco q1 sales 2025,37731,311,38042,gemini-2.5-pro,True
+2026-03-20 16:57:30,costco q1 sales 2025 vs costco q1 sales 2026,37762,374,38136,gemini-2.5-pro,True
+2026-03-20 17:37:31,Tell me walmart sales for 2026,38227,209,38436,gemini-2.5-pro,True
+2026-03-20 17:39:59,Compare costco sales q1 2025 vs q1 2026,37387,373,37760,gemini-2.5-pro,True
+2026-03-20 17:43:26,compare home depot q1 2025 to q1 2026 by item class,149829,1502,151331,gemini-2.5-pro,True
+2026-04-07 20:09:20,Top 10 customers by net sales,0,0,0,gpt-4o,False
+2026-04-07 20:27:41,top 10 customers,0,0,0,gpt-4o,False
+2026-04-07 20:42:18,top 10 customers,0,0,0,gpt-4.1,False
+2026-04-07 21:09:14,top 10 customers,0,0,0,gpt-5,False
+2026-04-08 14:14:54,top 10 customers,101627,289,101916,gpt-4o,True
+2026-04-08 17:08:44,top 10 customers,201483,233,201716,gpt-4o,False

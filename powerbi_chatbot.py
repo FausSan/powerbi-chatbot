@@ -1,508 +1,394 @@
 """
-app.py — Streamlit frontend for the Power BI Chatbot
+Power BI Chatbot — Azure OpenAI GPT + DAX execution
 =====================================================
-Run:
-    streamlit run app.py
-    streamlit run app.py -- --auth devicecode   # force auth method
+Authentication options (in priority order):
+  1. POWERBI_TOKEN env var  — paste a token you obtained externally
+  2. PowerShell method      — calls Connect-PowerBIServiceAccount + Get-PowerBIAccessToken
+                              (requires MicrosoftPowerBIMgmt module, Windows only)
+  3. MSAL device-code flow  — cross-platform fallback, prints a code you enter in a browser
 
-Requires powerbi_chatbot.py to be in the same directory.
+Required .env vars:
+  AZURE_OPENAI_ENDPOINT    = https://your-resource.openai.azure.com/
+  AZURE_OPENAI_API_KEY     = your-api-key
+  AZURE_OPENAI_DEPLOYMENT  = gpt-4o          # your deployment name
+  AZURE_OPENAI_API_VERSION = 2024-02-15-preview
+
+Run:
+    python powerbi_chatbot.py                  # interactive chat loop
+    python powerbi_chatbot.py --once "question" # single question, then exit
+    python powerbi_chatbot.py --auth powershell # force PowerShell auth
+    python powerbi_chatbot.py --auth devicecode # force device-code auth
+    python powerbi_chatbot.py --auth env        # force env-var token
 """
 
+import os
 import sys
 import json
-import textwrap
+import time
+import re
 import argparse
-import streamlit as st
+import subprocess
+import textwrap
+from typing import Any, Dict, List, Optional
+
+import requests
+import msal
 import pandas as pd
-from auth import acquire_token
-# ── Import backend ──────────────────────────────────────────────────────────
-# We import the chatbot module but override ask() to also return the
-# intermediate DAX and dataframe for display in the UI.
-from powerbi_chatbot import (
-    ask,
-    execute_dax,
-    result_to_dataframe,
-    run_function_calling_turn,
-    generate_response,
-    build_dax_instruction,
-    build_answer_instruction,
-    parse_json_strict,
-    _extract_pbi_error,
-    _call_openai,
-    fetch_column_values,
-    begin_question,
-    flush_tokens,
-    DAX_MAX_RETRIES,
-    SCHEMA_PATH,
-    TOKEN_LOG_PATH,
-    OPENAI_TOOLS,
+from dotenv import load_dotenv
+from openai import AzureOpenAI
+
+
+# ──────────────────────────────────────────
+# Config
+# ──────────────────────────────────────────
+load_dotenv()
+
+TENANT_ID   = os.environ["TENANT_ID"]
+CLIENT_ID   = os.environ["CLIENT_ID"]
+GROUP_ID    = os.environ["GROUP_ID"]
+DATASET_ID  = os.environ["DATASET_ID"]
+
+AZURE_OPENAI_ENDPOINT   = os.environ["AZURE_OPENAI_ENDPOINT"]
+AZURE_OPENAI_API_KEY    = os.environ["AZURE_OPENAI_API_KEY"]
+AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
+AZURE_OPENAI_API_VERSION= os.environ.get("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
+SCHEMA_PATH             = os.environ.get("SCHEMA_PATH", "schema/semantic_model.json")
+
+POWERBI_RESOURCE = "https://analysis.windows.net/powerbi/api"
+EXECUTE_DAX_URL  = (
+    f"https://api.powerbi.com/v1.0/myorg/groups/{GROUP_ID}"
+    f"/datasets/{DATASET_ID}/executeQueries"
 )
 
-# ── Page config ─────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="PBI Analyst",
-    page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
-
-# ── Custom CSS ───────────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap');
-
-/* ── Base ── */
-html, body, [class*="css"] {
-    font-family: 'IBM Plex Sans', sans-serif;
-    background-color: #0a0e14;
-    color: #c9d1d9;
-}
-
-.stApp {
-    background-color: #0a0e14;
-}
-
-/* ── Hide streamlit chrome ── */
-#MainMenu, footer, header { visibility: hidden; }
-.stDeployButton { display: none; }
-[data-testid="stToolbar"] { display: none; }
-
-/* ── Header ── */
-.pbi-header {
-    display: flex;
-    align-items: center;
-    gap: 14px;
-    padding: 28px 0 20px 0;
-    border-bottom: 1px solid #1e2940;
-    margin-bottom: 32px;
-}
-.pbi-logo {
-    width: 38px;
-    height: 38px;
-    background: linear-gradient(135deg, #f2c811 0%, #e8a000 100%);
-    border-radius: 8px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 20px;
-    flex-shrink: 0;
-}
-.pbi-title {
-    font-size: 22px;
-    font-weight: 600;
-    color: #e6edf3;
-    letter-spacing: -0.3px;
-}
-.pbi-subtitle {
-    font-size: 12px;
-    color: #6e7681;
-    font-family: 'IBM Plex Mono', monospace;
-    letter-spacing: 0.5px;
-    text-transform: uppercase;
-    margin-top: 2px;
-}
-.status-dot {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    margin-left: auto;
-    flex-shrink: 0;
-}
-.status-dot.connected { background: #3fb950; box-shadow: 0 0 8px #3fb95066; }
-.status-dot.disconnected { background: #f85149; }
-.status-dot.connecting {
-    background: #f2c811;
-    animation: pulse 1.5s ease-in-out infinite;
-}
-@keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.3; }
-}
-
-/* ── Chat messages ── */
-.msg-wrapper {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    margin-bottom: 24px;
-    animation: fadeIn 0.3s ease;
-}
-@keyframes fadeIn {
-    from { opacity: 0; transform: translateY(6px); }
-    to   { opacity: 1; transform: translateY(0); }
-}
-.msg-role {
-    font-size: 10px;
-    font-family: 'IBM Plex Mono', monospace;
-    letter-spacing: 1px;
-    text-transform: uppercase;
-    color: #6e7681;
-    padding-left: 2px;
-}
-.msg-bubble {
-    padding: 14px 18px;
-    border-radius: 10px;
-    font-size: 14.5px;
-    line-height: 1.65;
-    max-width: 85%;
-}
-.msg-bubble.user {
-    background: #161b27;
-    border: 1px solid #1e2940;
-    color: #c9d1d9;
-    align-self: flex-end;
-    border-bottom-right-radius: 3px;
-}
-.msg-bubble.assistant {
-    background: #0d1117;
-    border: 1px solid #1e2940;
-    color: #c9d1d9;
-    align-self: flex-start;
-    border-bottom-left-radius: 3px;
-}
-.msg-bubble.error {
-    background: #1a0a0a;
-    border: 1px solid #f8514933;
-    color: #f85149;
-}
-
-/* ── DAX expander ── */
-.dax-block {
-    background: #060a10;
-    border: 1px solid #1e2940;
-    border-radius: 8px;
-    padding: 14px 16px;
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 12.5px;
-    color: #79c0ff;
-    line-height: 1.7;
-    overflow-x: auto;
-    white-space: pre;
-    margin-top: 10px;
-}
-.dax-label {
-    font-size: 10px;
-    font-family: 'IBM Plex Mono', monospace;
-    letter-spacing: 1px;
-    text-transform: uppercase;
-    color: #6e7681;
-    margin-bottom: 6px;
-}
-
-/* ── Tool call badge ── */
-.tool-badge {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    background: #0d1b2a;
-    border: 1px solid #1e3a5f;
-    border-radius: 20px;
-    padding: 4px 12px;
-    font-size: 11px;
-    font-family: 'IBM Plex Mono', monospace;
-    color: #58a6ff;
-    margin: 4px 4px 4px 0;
-}
-
-/* ── Data table ── */
-.data-section {
-    margin-top: 14px;
-}
-.data-label {
-    font-size: 10px;
-    font-family: 'IBM Plex Mono', monospace;
-    letter-spacing: 1px;
-    text-transform: uppercase;
-    color: #6e7681;
-    margin-bottom: 8px;
-}
-
-/* ── Streamlit dataframe overrides ── */
-[data-testid="stDataFrame"] {
-    border: 1px solid #1e2940 !important;
-    border-radius: 8px !important;
-    overflow: hidden;
-}
-
-/* ── Input area ── */
-.input-area {
-    position: sticky;
-    bottom: 0;
-    background: linear-gradient(transparent, #0a0e14 30%);
-    padding: 20px 0 16px 0;
-    margin-top: 12px;
-}
-
-/* ── Streamlit input overrides ── */
-.stTextInput > div > div > input {
-    background: #0d1117 !important;
-    border: 1px solid #30363d !important;
-    border-radius: 10px !important;
-    color: #e6edf3 !important;
-    font-family: 'IBM Plex Sans', sans-serif !important;
-    font-size: 14px !important;
-    padding: 12px 16px !important;
-    caret-color: #f2c811;
-}
-.stTextInput > div > div > input:focus {
-    border-color: #f2c811 !important;
-    box-shadow: 0 0 0 3px #f2c81118 !important;
-}
-.stTextInput > div > div > input::placeholder {
-    color: #484f58 !important;
-}
-
-/* ── Button ── */
-.stButton > button {
-    background: #f2c811 !important;
-    color: #0a0e14 !important;
-    border: none !important;
-    border-radius: 8px !important;
-    font-family: 'IBM Plex Sans', sans-serif !important;
-    font-weight: 600 !important;
-    font-size: 13px !important;
-    padding: 10px 22px !important;
-    letter-spacing: 0.3px;
-    transition: all 0.15s ease !important;
-    height: 46px !important;
-}
-.stButton > button:hover {
-    background: #ffd433 !important;
-    transform: translateY(-1px);
-    box-shadow: 0 4px 12px #f2c81130 !important;
-}
-.stButton > button:active {
-    transform: translateY(0) !important;
-}
-
-/* ── Auth screen ── */
-.auth-card {
-    max-width: 440px;
-    margin: 80px auto;
-    background: #0d1117;
-    border: 1px solid #1e2940;
-    border-radius: 16px;
-    padding: 40px;
-    text-align: center;
-}
-.auth-icon {
-    font-size: 48px;
-    margin-bottom: 20px;
-}
-.auth-title {
-    font-size: 22px;
-    font-weight: 600;
-    color: #e6edf3;
-    margin-bottom: 8px;
-}
-.auth-desc {
-    font-size: 13.5px;
-    color: #6e7681;
-    line-height: 1.6;
-    margin-bottom: 28px;
-}
-
-/* ── Spinner override ── */
-.stSpinner > div {
-    border-top-color: #f2c811 !important;
-}
-
-/* ── Expander ── */
-[data-testid="stExpander"] {
-    background: #0d1117 !important;
-    border: 1px solid #1e2940 !important;
-    border-radius: 8px !important;
-}
-[data-testid="stExpander"] summary {
-    color: #6e7681 !important;
-    font-size: 12px !important;
-    font-family: 'IBM Plex Mono', monospace !important;
-}
-
-/* ── Token counter ── */
-.token-counter {
-    display: flex;
-    gap: 16px;
-    margin-left: auto;
-    align-items: center;
-}
-.token-stat {
-    text-align: right;
-}
-.token-stat-value {
-    font-size: 13px;
-    font-family: 'IBM Plex Mono', monospace;
-    color: #f2c811;
-    font-weight: 500;
-}
-.token-stat-label {
-    font-size: 9px;
-    font-family: 'IBM Plex Mono', monospace;
-    letter-spacing: 0.8px;
-    text-transform: uppercase;
-    color: #484f58;
-}
-.token-divider {
-    width: 1px;
-    height: 28px;
-    background: #1e2940;
-}
-::-webkit-scrollbar { width: 6px; height: 6px; }
-::-webkit-scrollbar-track { background: #0a0e14; }
-::-webkit-scrollbar-thumb { background: #21262d; border-radius: 3px; }
-::-webkit-scrollbar-thumb:hover { background: #30363d; }
-
-/* ── Notes text ── */
-.notes-text {
-    font-size: 12.5px;
-    color: #8b949e;
-    font-style: italic;
-    margin-top: 8px;
-    padding-left: 2px;
-}
-</style>
-""", unsafe_allow_html=True)
+MAX_ROWS_RETURNED = 200   # hard cap sent to Power BI
+MAX_ROWS_TO_LLM   = 100   # rows forwarded to Gemini for summarisation
 
 
-# ── Auth method from CLI args ────────────────────────────────────────────────
-def _get_auth_method() -> str:
-    """Parse --auth from sys.argv (Streamlit passes unknown args through)."""
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--auth", default="auto",
-                        choices=["auto", "env", "powershell", "devicecode"])
-    args, _ = parser.parse_known_args()
-    return args.auth
+# ──────────────────────────────────────────
+# Authentication
+# ──────────────────────────────────────────
+
+def _token_from_env() -> Optional[str]:
+    """Read a pre-obtained token from the environment."""
+    return os.environ.get("POWERBI_TOKEN") or None
 
 
-# ── Session state init ───────────────────────────────────────────────────────
-if "token" not in st.session_state:
-    st.session_state.token = None
-if "schema" not in st.session_state:
-    st.session_state.schema = None
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "auth_error" not in st.session_state:
-    st.session_state.auth_error = None
-if "pending_question" not in st.session_state:
-    st.session_state.pending_question = None
-if "session_tokens" not in st.session_state:
-    st.session_state.session_tokens = {"input": 0, "output": 0}  # cumulative for this session
-
-
-# ── Ask with metadata ────────────────────────────────────────────────────────
-def ask_with_meta(question: str, schema: dict, token: str) -> dict:
+def _token_from_powershell() -> str:
     """
-    Runs the full pipeline and returns a dict with:
-      answer, dax, notes, df, tool_calls, tokens, error
-    so the UI can render each piece separately.
+    Equivalent of:
+        Connect-PowerBIServiceAccount
+        $token = Get-PowerBIAccessToken
+    Requires the MicrosoftPowerBIMgmt module and PowerShell ≥ 5.
     """
-    result = {
-        "answer":     "",
-        "dax":        "",
-        "notes":      "",
-        "df":         None,
-        "tool_calls": [],
-        "tokens":     {"input": 0, "output": 0},
-        "error":      None,
+    ps_exe = "pwsh" if _command_exists("pwsh") else "powershell"
+
+    ps_script = textwrap.dedent("""
+        Import-Module MicrosoftPowerBIMgmt -ErrorAction Stop
+        Connect-PowerBIServiceAccount | Out-Null
+        $t = Get-PowerBIAccessToken
+        Write-Output $t["Authorization"]
+    """)
+
+    print("[auth] Launching PowerShell — a browser window will open for sign-in.")
+    result = subprocess.run(
+        # Remove -NonInteractive so the browser popup can appear
+        [ps_exe, "-NoProfile", "-Command", ps_script],
+        capture_output=True, text=True
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"PowerShell auth failed.\nSTDERR: {result.stderr.strip()}"
+        )
+
+    lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
+    if not lines:
+        raise RuntimeError("PowerShell returned no token output.")
+
+    header_value = lines[-1]
+    if not header_value.startswith("Bearer "):
+        raise RuntimeError(f"Unexpected token format: {header_value[:60]}")
+
+    return header_value.split(" ", 1)[1]
+
+
+def _token_from_device_code() -> str:
+    """
+    MSAL device-code flow — cross-platform, no popup browser.
+    Prints a short code; the user visits aka.ms/devicelogin to authenticate.
+    NOTE: Uses PublicClientApplication — no CLIENT_SECRET needed or used.
+    """
+    # Warn if CLIENT_SECRET is set — it is NOT used here and may indicate
+    # the user is confusing this with service principal auth.
+    if os.environ.get("CLIENT_SECRET"):
+        print("[auth] Warning: CLIENT_SECRET is set in your .env but is NOT used "
+              "for device-code or PowerShell auth. If you are seeing AADSTS errors, "
+              "make sure your Azure app registration allows public client flows.")
+
+    app = msal.PublicClientApplication(
+        client_id=CLIENT_ID,
+        authority=f"https://login.microsoftonline.com/{TENANT_ID}",
+    )
+
+    flow = app.initiate_device_flow(scopes=[f"{POWERBI_RESOURCE}/.default"])
+    if "user_code" not in flow:
+        raise RuntimeError(f"Device-code flow failed: {flow}")
+
+    print(flow["message"])
+
+    result = app.acquire_token_by_device_flow(flow)
+    if "access_token" not in result:
+        raise RuntimeError(
+            f"Device-code auth failed: {result.get('error_description', result)}"
+        )
+
+    return result["access_token"]
+
+
+def _command_exists(cmd: str) -> bool:
+    import shutil
+    return shutil.which(cmd) is not None
+
+
+def acquire_token(method: str = "auto") -> str:
+    """
+    method: "auto" | "env" | "powershell" | "devicecode"
+    """
+    if method == "auto":
+        token = _token_from_env()
+        if token:
+            print("[auth] Using token from POWERBI_TOKEN env var.")
+            return token
+        if _command_exists("powershell") or _command_exists("pwsh"):
+            print("[auth] PowerShell found — using PowerShell auth.")
+            return _token_from_powershell()
+        print("[auth] Falling back to device-code flow.")
+        return _token_from_device_code()
+
+    if method == "env":
+        token = _token_from_env()
+        if not token:
+            raise RuntimeError("POWERBI_TOKEN env var is not set.")
+        return token
+
+    if method == "powershell":
+        return _token_from_powershell()
+
+    if method == "devicecode":
+        return _token_from_device_code()
+
+    raise ValueError(f"Unknown auth method: {method}")
+
+
+# ──────────────────────────────────────────
+# DAX execution
+# ──────────────────────────────────────────
+
+def execute_dax(token: str, dax: str) -> Dict[str, Any]:
+    """
+    POST to the executeQueries endpoint.
+    https://learn.microsoft.com/en-us/rest/api/power-bi/datasets/execute-queries-in-group
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "queries": [{"query": dax}],
+        "serializerSettings": {"includeNulls": True},
+        "impersonatedUserName": None,   # omit or set to a UPN to impersonate
     }
 
-    begin_question(question)
-    prior_dax = ""
-    error_msg = ""
-    success   = False
+    resp = requests.post(EXECUTE_DAX_URL, headers=headers, json=payload, timeout=120)
 
+    # Surface a helpful error if the request fails
+    if not resp.ok:
+        raise RuntimeError(
+            f"DAX execution failed [{resp.status_code}]: {resp.text[:500]}"
+        )
+
+    return resp.json()
+
+
+def result_to_dataframe(result_json: Dict[str, Any]) -> pd.DataFrame:
+    """Parse the executeQueries JSON response into a DataFrame."""
     try:
-        for attempt in range(1, DAX_MAX_RETRIES + 1):
-            if attempt == 1:
-                raw, tool_calls = _run_fc_turn_with_log(question, schema, token)
-                result["tool_calls"] = tool_calls
-            else:
-                raw = generate_response(
-                    build_dax_instruction(schema, question, prior_dax, error_msg)
-                )
+        tables = result_json["results"][0]["tables"]
+    except (KeyError, IndexError):
+        return pd.DataFrame()
 
-            try:
-                obj = parse_json_strict(raw)
-            except (ValueError, Exception) as exc:
-                result["error"] = f"Could not parse model output: {exc}\n\n{raw[:400]}"
-                return result
+    if not tables:
+        return pd.DataFrame()
 
-            dax   = obj.get("dax", "").strip()
-            notes = obj.get("notes", "")
-            result["dax"]   = dax
-            result["notes"] = notes
+    rows = tables[0].get("rows", [])
 
-            if "EVALUATE" not in dax.upper():
-                result["error"] = f"Generated DAX contains no EVALUATE statement:\n{dax[:300]}"
-                return result
-
-            try:
-                result_json = execute_dax(token, dax)
-                break
-            except RuntimeError as exc:
-                error_msg = _extract_pbi_error(exc)
-                prior_dax = dax
-                if attempt == DAX_MAX_RETRIES:
-                    result["error"] = (f"DAX failed after {DAX_MAX_RETRIES} attempts.\n\n"
-                                       f"Last error: {error_msg}")
-                    return result
-                continue
-
-        df = result_to_dataframe(result_json)
-        if df.empty:
-            result["answer"] = "The query returned no rows."
-            success = True
-            return result
-
-        result["df"]     = df
-        result["answer"] = generate_response(build_answer_instruction(question, df))
-        success = True
-        return result
-
-    finally:
-        counts = flush_tokens(success=success)
-        result["tokens"] = counts
+    # Power BI prefixes column names with the table name, e.g. "Sales[Amount]"
+    # Strip the prefix for cleaner output.
+    df = pd.DataFrame(rows)
+    df.columns = [re.sub(r"^[^\[]+\[(.+)\]$", r"\1", c) for c in df.columns]
+    return df
 
 
-def _run_fc_turn_with_log(question, schema, token):
+# ──────────────────────────────────────────
+# Gemini (Vertex AI) + Function Calling
+# ──────────────────────────────────────────
+
+# ──────────────────────────────────────────
+# Azure OpenAI + Function Calling
+# ──────────────────────────────────────────
+
+# ── Tool definition (OpenAI function calling format) ──
+OPENAI_TOOLS: List[Dict] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_column_values",
+            "description": (
+                "Fetches the distinct values of any dimension column from Power BI. "
+                "Call this whenever the user mentions a name, label or entity that needs "
+                "to be matched to an exact stored value before writing a DAX filter. "
+                "Examples: customer names, sales rep names, product names, regions, etc. "
+                "Returns a JSON object with a 'values' key containing an array of strings "
+                "that are the closest matches to the search hint."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "table": {
+                        "type": "string",
+                        "description": "The Power BI table name exactly as it appears in the schema, e.g. 'W_CUST_MBBFREP_D'.",
+                    },
+                    "column": {
+                        "type": "string",
+                        "description": "The column name exactly as it appears in the schema, e.g. 'AlphaSortName'.",
+                    },
+                    "search_hint": {
+                        "type": "string",
+                        "description": (
+                            "A word or phrase from the user's question to filter the results, "
+                            "e.g. 'walmart' or 'john smith'. Leave empty to return all values."
+                        ),
+                    },
+                },
+                "required": ["table", "column"],
+            },
+        },
+    }
+]
+
+# ── Azure OpenAI client singleton ──────────
+_oai_client: Optional[AzureOpenAI] = None
+
+
+def _get_client() -> AzureOpenAI:
+    global _oai_client
+    if _oai_client is None:
+        _oai_client = AzureOpenAI(
+            azure_endpoint=AZURE_OPENAI_ENDPOINT,
+            api_key=AZURE_OPENAI_API_KEY,
+            api_version=AZURE_OPENAI_API_VERSION,
+        )
+    return _oai_client
+
+
+def _call_openai(messages: List[Dict], use_tools: bool = False) -> Any:
     """
-    Runs the function-calling turn and captures which tool calls were made.
-    Returns (raw_text, list_of_tool_call_strings).
+    Low-level Azure OpenAI call with retry logic.
+    Returns the raw completion response object.
     """
-    import powerbi_chatbot as _bot
+    client = _get_client()
+    kwargs: Dict[str, Any] = {
+        "model":       AZURE_OPENAI_DEPLOYMENT,
+        "messages":    messages,
+        "temperature": 0.1,
+        "max_tokens":  4096,
+    }
+    if use_tools:
+        kwargs["tools"]       = OPENAI_TOOLS
+        kwargs["tool_choice"] = "auto"
 
-    tool_calls_log = []
-    messages = [{"role": "user", "content": _bot.build_dax_instruction(schema, question)}]
+    for attempt in range(6):
+        try:
+            response = client.chat.completions.create(**kwargs)
+            _accumulate_tokens(response)
+            return response
+        except Exception as exc:
+            # Don't retry on configuration errors — fail fast with a clear message
+            err_str = str(exc)
+            if any(code in err_str for code in ["404", "401", "400", "NotFound", "Unauthorized", "DeploymentNotFound"]):
+                raise RuntimeError(
+                    f"Azure OpenAI configuration error: {exc}\n\n"
+                    f"Check these .env values:\n"
+                    f"  AZURE_OPENAI_ENDPOINT   = {AZURE_OPENAI_ENDPOINT}\n"
+                    f"  AZURE_OPENAI_DEPLOYMENT = {AZURE_OPENAI_DEPLOYMENT}\n"
+                    f"  AZURE_OPENAI_API_VERSION= {AZURE_OPENAI_API_VERSION}\n"
+                    f"  AZURE_OPENAI_API_KEY    = {'set' if AZURE_OPENAI_API_KEY else 'NOT SET'}"
+                ) from exc
+            # Retry on rate limits and server errors
+            if attempt == 5:
+                raise
+            wait = 2 ** attempt
+            print(f"[openai] Transient error ({exc.__class__.__name__}), retrying in {wait}s…")
+            time.sleep(wait)
+
+
+def generate_response(instruction: str) -> str:
+    """Simple single-turn text generation."""
+    response = _call_openai(
+        [{"role": "user", "content": instruction}],
+        use_tools=False,
+    )
+    return response.choices[0].message.content or ""
+
+
+def run_function_calling_turn(question: str, schema: Dict[str, Any], token: str) -> str:
+    """
+    Multi-turn Azure OpenAI conversation with function calling.
+
+    Flow:
+      1. Send the question + schema to GPT with tools available.
+      2. If GPT calls get_column_values → execute it, return results, continue.
+      3. Once GPT has what it needs, it produces the final DAX JSON response.
+
+    Returns the raw text of GPT's final response (the DAX JSON string).
+    """
+    messages: List[Dict] = [
+        {"role": "user", "content": build_dax_instruction(schema, question)}
+    ]
 
     while True:
-        response   = _bot._call_openai(messages, use_tools=True)
-        msg        = response.choices[0].message
+        response  = _call_openai(messages, use_tools=True)
+        msg       = response.choices[0].message
         tool_calls = msg.tool_calls or []
 
+        # No tool calls → GPT is done, return its text
         if not tool_calls:
-            return msg.content or "", tool_calls_log
+            return msg.content or ""
 
-        # Append GPT's response to conversation
+        # Append GPT's response (with tool_calls) to the conversation
         messages.append(msg)
 
+        # Execute each tool call and append results
         for tc in tool_calls:
             fn_name = tc.function.name
+            print(f"   [tool call] {fn_name}()")
+
             try:
                 args = json.loads(tc.function.arguments)
             except json.JSONDecodeError:
                 args = {}
 
-            table  = args.get("table", "")
-            column = args.get("column", "")
-            hint   = args.get("search_hint", question)
-
-            tool_calls_log.append(f"{fn_name}({table}[{column}], hint='{hint}')")
-
-            if fn_name == "get_column_values" and table and column:
-                values  = _bot.fetch_column_values(token, table, column, hint)
-                payload = {"values": values}
+            if fn_name == "get_column_values":
+                table       = args.get("table", "")
+                column      = args.get("column", "")
+                search_hint = args.get("search_hint", question)
+                if table and column:
+                    values  = fetch_column_values(token, table, column, search_hint)
+                    payload = {"values": values}
+                else:
+                    payload = {"error": "Both 'table' and 'column' are required."}
             else:
-                payload = {"error": f"Unknown function or missing args: {fn_name}"}
+                payload = {"error": f"Unknown function: {fn_name}"}
 
             messages.append({
                 "role":         "tool",
@@ -510,217 +396,555 @@ def _run_fc_turn_with_log(question, schema, token):
                 "content":      json.dumps(payload),
             })
 
+# ── Column value cache ────────────────────
+# Shared text utilities for fuzzy matching
+_STOP_WORDS = {
+    "a", "an", "the", "is", "are", "was", "were", "what", "which", "who",
+    "how", "when", "where", "why", "do", "does", "did", "have", "has",
+    "had", "will", "would", "could", "should", "may", "might", "shall",
+    "be", "been", "being", "and", "or", "but", "if", "in", "on", "at",
+    "to", "for", "of", "with", "by", "from", "up", "about", "into",
+    "than", "then", "so", "yet", "both", "either", "not", "no", "nor",
+    "as", "just", "vs", "versus", "between", "show", "me", "get", "give",
+    "list", "tell", "find", "compare", "sales", "revenue", "growth",
+    "total", "top", "last", "this", "year", "month", "quarter", "q1",
+    "q2", "q3", "q4", "ytd", "yoy", "2020", "2021", "2022", "2023",
+    "2024", "2025", "2026", "january", "february", "march", "april",
+    "may", "june", "july", "august", "september", "october", "november",
+    "december",
+}
 
-# ── Render a single chat message ─────────────────────────────────────────────
-def render_message(msg: dict):
-    role    = msg["role"]
-    content = msg["content"]
-    meta    = msg.get("meta", {})
 
-    role_label = "You" if role == "user" else "PBI Analyst"
-    bubble_cls = "user" if role == "user" else "assistant"
+def _normalize_compact(text: str) -> str:
+    """Lowercase and strip ALL non-alphanumeric characters — 'WAL-MART' → 'walmart'."""
+    return re.sub(r"[^a-z0-9]", "", text.lower())
 
-    if meta.get("error"):
-        bubble_cls = "error"
 
-    st.markdown(f"""
-    <div class="msg-wrapper">
-        <div class="msg-role">{role_label}</div>
-        <div class="msg-bubble {bubble_cls}">{content}</div>
-    </div>
-    """, unsafe_allow_html=True)
+def _extract_search_terms(text: str) -> list[str]:
+    """
+    Extract meaningful tokens from any text (question or search hint).
+    Strips punctuation, lowercases, removes stop words and short tokens.
+    e.g. "What are Walmart's sales Q1 2024?" → ["walmart"]
+    """
+    tokens = re.findall(r"[a-zA-Z0-9]+", text.lower())
+    return [t for t in tokens if t not in _STOP_WORDS and len(t) >= 3]
 
-    # Tool calls badge row
-    if meta.get("tool_calls"):
-        badges = "".join(
-            f'<span class="tool-badge">⚡ {tc}</span>'
-            for tc in meta["tool_calls"]
+
+# Stores fetched distinct values per (table, column) pair — fetched at most once
+# per session each.
+_column_cache: Dict[tuple, list] = {}
+
+
+def fetch_column_values(token: str, table: str, column: str,
+                        search_hint: str = "") -> list:
+    """
+    Fetch distinct values for any table/column from Power BI (cached per session).
+    If search_hint is provided, returns only values whose normalized form contains
+    at least one meaningful word from the hint.
+    """
+    cache_key = (table, column)
+
+    if cache_key not in _column_cache:
+        print(f"   [tool] Fetching distinct values for {table}[{column}]…")
+        dax = f"EVALUATE DISTINCT('{table}'[{column}])"
+        try:
+            result = execute_dax(token, dax)
+            df = result_to_dataframe(result)
+            values = df.iloc[:, 0].dropna().astype(str).tolist() if not df.empty else []
+        except Exception as exc:
+            print(f"   [tool] Warning: could not fetch {table}[{column}]: {exc}")
+            values = []
+        _column_cache[cache_key] = sorted(values)
+        print(f"   [tool] {len(_column_cache[cache_key])} values loaded into cache.")
+
+    all_values = _column_cache[cache_key]
+
+    if not search_hint:
+        return all_values
+
+    # Extract meaningful tokens from the hint using the same stop-word filter
+    terms = _extract_search_terms(search_hint)
+    if not terms:
+        return all_values
+
+    filtered = [
+        v for v in all_values
+        if any(term in _normalize_compact(v) for term in terms)
+    ]
+
+    print(f"   [tool] Filtered {table}[{column}] to {len(filtered)} matches "
+          f"for terms {terms}")
+    print(f"   [tool] Matches: {filtered}")
+
+    matches = filtered if filtered else all_values
+    # Cap to avoid blowing the token budget with huge lists
+    if len(matches) > MAX_TOOL_RESPONSE_VALUES:
+        print(f"   [tool] Capping to {MAX_TOOL_RESPONSE_VALUES} values.")
+        matches = matches[:MAX_TOOL_RESPONSE_VALUES]
+    return matches
+
+
+
+
+
+
+# ──────────────────────────────────────────
+# Token tracking
+# ──────────────────────────────────────────
+import csv
+from datetime import datetime
+
+TOKEN_LOG_PATH = os.environ.get("TOKEN_LOG_PATH", "token_usage.csv")
+
+# Accumulated tokens for the current question (reset by begin_question / flush_tokens)
+_current_tokens: Dict[str, int] = {"input": 0, "output": 0}
+_current_question: str = ""
+
+
+def begin_question(question: str) -> None:
+    """Call before processing a new question to reset the per-question counter."""
+    global _current_tokens, _current_question
+    _current_tokens   = {"input": 0, "output": 0}
+    _current_question = question
+
+
+def _accumulate_tokens(response: Any) -> None:
+    """Extract token counts from an OpenAI response and add to the running total."""
+    try:
+        usage = response.usage
+        _current_tokens["input"]  += getattr(usage, "prompt_tokens", 0) or 0
+        _current_tokens["output"] += getattr(usage, "completion_tokens", 0) or 0
+    except Exception:
+        pass  # never break the pipeline over logging
+
+
+def flush_tokens(success: bool = True) -> Dict[str, int]:
+    """
+    Write the accumulated token counts for the current question to the CSV log.
+    Returns the counts so the caller can display them.
+    """
+    snapshot = dict(_current_tokens)
+    total    = snapshot["input"] + snapshot["output"]
+
+    row = {
+        "timestamp":      datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        "question":       _current_question,
+        "input_tokens":   snapshot["input"],
+        "output_tokens":  snapshot["output"],
+        "total_tokens":   total,
+        "model":          AZURE_OPENAI_DEPLOYMENT,
+        "success":        success,
+    }
+
+    file_exists = os.path.isfile(TOKEN_LOG_PATH)
+    try:
+        with open(TOKEN_LOG_PATH, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=row.keys())
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(row)
+        print(f"[tokens] input={snapshot['input']}  output={snapshot['output']}  "
+              f"total={total}  → {TOKEN_LOG_PATH}")
+    except Exception as exc:
+        print(f"[tokens] Warning: could not write token log: {exc}")
+
+    return snapshot
+
+
+
+
+
+
+# ──────────────────────────────────────────
+# Prompt engineering
+# ──────────────────────────────────────────
+
+DAX_SYSTEM_PROMPT = """
+You are a Power BI DAX expert. Your job is to translate business questions into
+correct DAX queries against a provided semantic model schema.
+
+## Output format
+Return valid JSON with exactly two keys:
+  "dax"   : the full DAX query string
+  "notes" : one sentence explaining what the query does
+
+No markdown fences, no text outside the JSON object.
+
+## How DAX evaluation works — read this before writing any query
+
+Understanding DAX's execution model will help you avoid the most common errors.
+
+DAX is not SQL. There are no "rows" in the traditional sense — instead, DAX
+operates on filter contexts and row contexts propagated through relationships.
+The key things to understand for writing correct EVALUATE queries are:
+
+**Measures vs Columns**
+The schema distinguishes between "columns" and "measures". They behave very
+differently and must never be confused:
+
+- A *column* (e.g. 'Sales'[Region]) is a physical value stored in a table.
+  It can be used in groupBy arguments, FILTER predicates, and relationships.
+
+- A *measure* (e.g. [Net Sales]) is a DAX expression that is evaluated lazily
+  inside a filter context. Measures do not exist as column values — they are
+  computed on demand. This is why you cannot reference a measure like a column.
+
+The practical consequence: measures listed in the schema already exist in the
+model. You call them directly as [Measure Name] inside SUMMARIZECOLUMNS or
+ADDCOLUMNS. You never need to re-declare them with DEFINE MEASURE. In fact,
+wrapping an existing measure in DEFINE MEASURE will break the query, because
+inside the DEFINE block there is no filter context to evaluate [Measure Name]
+against — DAX will report "cannot be determined".
+
+DEFINE MEASURE is only appropriate when you need a *brand-new* calculated
+expression that does not exist in the model (e.g. a custom ratio).
+
+**The right way to use measures**
+
+Use SUMMARIZECOLUMNS to group by columns and pull in measure values:
+
+    EVALUATE
+        SUMMARIZECOLUMNS(
+            'DimCustomer'[CustomerName],
+            "Net Sales", [Net Sales]
         )
-        st.markdown(badges, unsafe_allow_html=True)
 
-    # DAX + data in expander
-    if meta.get("dax") and not meta.get("error"):
-        with st.expander("View DAX & data", expanded=False):
-            if meta.get("notes"):
-                st.markdown(f'<div class="notes-text">📝 {meta["notes"]}</div>',
-                            unsafe_allow_html=True)
+To filter by a measure value, wrap SUMMARIZECOLUMNS in FILTER. Note that
+inside the FILTER predicate you reference the column alias you defined ("Net Sales"),
+not the measure directly:
 
-            # Token usage for this message
-            if meta.get("tokens"):
-                t = meta["tokens"]
-                total = t["input"] + t["output"]
-                st.markdown(
-                    f'<div class="notes-text" style="color:#484f58;">🔢 Tokens — '
-                    f'in: <span style="color:#f2c811">{t["input"]:,}</span> · '
-                    f'out: <span style="color:#f2c811">{t["output"]:,}</span> · '
-                    f'total: <span style="color:#f2c811">{total:,}</span></div>',
-                    unsafe_allow_html=True,
-                )
-            st.markdown('<div class="dax-label">Generated DAX</div>',
-                        unsafe_allow_html=True)
-            st.markdown(f'<div class="dax-block">{meta["dax"]}</div>',
-                        unsafe_allow_html=True)
-
-            if meta.get("df") is not None and not meta["df"].empty:
-                st.markdown('<div class="data-label" style="margin-top:16px;">Result table</div>',
-                            unsafe_allow_html=True)
-                st.dataframe(
-                    meta["df"],
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-
-# ── Auth screen ───────────────────────────────────────────────────────────────
-def render_auth_screen():
-    st.markdown("""
-    <div class="auth-card">
-        <div class="auth-icon">🔐</div>
-        <div class="auth-title">Connect to Power BI</div>
-        <div class="auth-desc">
-            Sign in with your Microsoft account to start querying your
-            Power BI dataset in natural language.
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    col1, col2, col3 = st.columns([1, 1.2, 1])
-    with col2:
-        if st.button("Sign in with Microsoft", use_container_width=True):
-            with st.spinner("Authenticating…"):
-                try:
-                    auth_method = _get_auth_method()
-                    token  = acquire_token(auth_method)
-                    schema = json.load(open(SCHEMA_PATH, encoding="utf-8"))
-                    st.session_state.token  = token
-                    st.session_state.schema = schema
-                    st.session_state.auth_error = None
-                    st.rerun()
-                except Exception as exc:
-                    st.session_state.auth_error = str(exc)
-
-    if st.session_state.auth_error:
-        st.error(f"Authentication failed: {st.session_state.auth_error}")
-
-
-# ── Main chat UI ──────────────────────────────────────────────────────────────
-def render_chat():
-    schema = st.session_state.schema
-    token  = st.session_state.token
-
-    # Header
-    sess_in  = st.session_state.session_tokens["input"]
-    sess_out = st.session_state.session_tokens["output"]
-    st.markdown(f"""
-    <div class="pbi-header">
-        <div class="pbi-logo">📊</div>
-        <div>
-            <div class="pbi-title">PBI Analyst</div>
-            <div class="pbi-subtitle">Gemini · Power BI · Natural Language</div>
-        </div>
-        <div class="token-counter">
-            <div class="token-stat">
-                <div class="token-stat-value">{sess_in:,}</div>
-                <div class="token-stat-label">in tokens</div>
-            </div>
-            <div class="token-divider"></div>
-            <div class="token-stat">
-                <div class="token-stat-value">{sess_out:,}</div>
-                <div class="token-stat-label">out tokens</div>
-            </div>
-            <div class="token-divider"></div>
-            <div class="token-stat">
-                <div class="token-stat-value">{sess_in + sess_out:,}</div>
-                <div class="token-stat-label">total</div>
-            </div>
-        </div>
-        <div class="status-dot connected" title="Connected"></div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    # Chat history
-    for msg in st.session_state.messages:
-        render_message(msg)
-
-    # Empty state
-    if not st.session_state.messages:
-        st.markdown("""
-        <div style="text-align:center; padding: 60px 0; color: #484f58;">
-            <div style="font-size: 36px; margin-bottom: 16px;">💬</div>
-            <div style="font-size: 15px; color: #6e7681;">
-                Ask anything about your Power BI data
-            </div>
-            <div style="font-size: 12px; color: #484f58; margin-top: 8px; font-family: 'IBM Plex Mono', monospace;">
-                e.g. "Top 10 customers by net sales" · "Compare Walmart Q1 2024 vs 2026"
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    # Input row
-    st.markdown('<div class="input-area">', unsafe_allow_html=True)
-    col_input, col_btn = st.columns([6, 1])
-
-    with col_input:
-        question = st.text_input(
-            label="question",
-            label_visibility="collapsed",
-            placeholder="Ask a question about your data…",
-            key="question_input",
+    EVALUATE
+        FILTER(
+            SUMMARIZECOLUMNS(
+                'DimCustomer'[CustomerName],
+                "Net Sales", [Net Sales]
+            ),
+            [Net Sales] > 0
         )
-    with col_btn:
-        send = st.button("Send", use_container_width=True)
 
-    st.markdown('</div>', unsafe_allow_html=True)
+**Matching entity names from get_column_values**
+When you call get_column_values and receive a list of candidate matches, you must
+select the MINIMUM number of values needed to answer the question:
+- If the user mentions ONE entity (e.g. "Home Depot"), pick EXACTLY ONE value —
+  the closest match. Do not include variants, subsidiaries, or similar names unless
+  the user explicitly asks to include them (e.g. "all Home Depot entities").
+- If the user mentions TWO entities for a comparison, pick exactly one value per entity.
+- Only use IN {{...}} with multiple values if the user explicitly asks for a group,
+  e.g. "all Walmart stores" or "any Home Depot location".
+- When in doubt, prefer the shorter/simpler name — "HOME DEPOT" over "HOME DEPOT (HD.COM)".
 
-    # On Send: store the question and clear the input, then rerun once to show
-    # the user bubble and trigger processing on the next pass.
-    if send and question.strip():
-        st.session_state.pending_question = question.strip()
-        st.rerun()
+When the question asks for a single-row comparison (e.g. "X vs Y", "Q1 2024 vs Q1 2026"),
+do NOT use SUMMARIZECOLUMNS with no groupBy columns — it does not support CALCULATE
+filters as column arguments and will return nulls.
 
-    # Process the pending question (runs on the rerun after Send was clicked)
-    if st.session_state.pending_question:
-        q = st.session_state.pending_question
-        st.session_state.pending_question = None  # clear immediately to prevent re-runs
+Use ROW() instead, which evaluates each measure in its own CALCULATE context:
 
-        # Add user message to history
-        st.session_state.messages.append({"role": "user", "content": q})
+    EVALUATE
+        ROW(
+            "Q1 2024 Sales", CALCULATE(
+                [Net Sales],
+                FILTER('W_CALENDAR_D', 'W_CALENDAR_D'[Year] = 2024 && 'W_CALENDAR_D'[Quarter] = 1),
+                FILTER('W_CUST_MBBFREP_D', 'W_CUST_MBBFREP_D'[AlphaSortName] = "WAL-MART STORES")
+            ),
+            "Q1 2026 Sales", CALCULATE(
+                [Net Sales],
+                FILTER('W_CALENDAR_D', 'W_CALENDAR_D'[Year] = 2026 && 'W_CALENDAR_D'[Quarter] = 1),
+                FILTER('W_CUST_MBBFREP_D', 'W_CUST_MBBFREP_D'[AlphaSortName] = "WAL-MART STORES")
+            )
+        )
 
-        # Run pipeline
-        with st.spinner("Thinking…"):
-            result = ask_with_meta(q, schema, token)
+Use ROW() any time the result is a fixed set of named scalar values.
+Use SUMMARIZECOLUMNS only when you are grouping by one or more dimension columns.
+Always limit results to {max_rows} rows using TOPN or a filter. For TOPN the
+sort column must be one of the named columns in the result table, not a measure
+reference from outside the table expression.
 
-        # Build assistant message
-        if result["error"]:
-            content = f"❌ {result['error']}"
-            meta    = {"error": True}
-        else:
-            content = result["answer"]
-            meta    = {
-                "dax":        result["dax"],
-                "notes":      result["notes"],
-                "df":         result["df"],
-                "tool_calls": result["tool_calls"],
-                "tokens":     result["tokens"],
-            }
-            # Accumulate into session totals
-            st.session_state.session_tokens["input"]  += result["tokens"]["input"]
-            st.session_state.session_tokens["output"] += result["tokens"]["output"]
+**Year-over-year**
+If a YoY comparison is requested with no explicit time period, compare
+year-to-date (DATESYTD) for the current year vs the same period last year
+using SAMEPERIODLASTYEAR or DATEADD.
 
-        st.session_state.messages.append({
-            "role": "assistant",
-            "content": content,
-            "meta": meta,
-        })
-        st.rerun()
+**General advice**
+Prefer SUMMARIZECOLUMNS over SUMMARIZE for queries that include measures — it
+handles blank rows and cross-filter context more predictably. Only fall back to
+ADDCOLUMNS(SUMMARIZE(...)) if you need to add computed columns to an existing
+row set.
+""".strip()
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
-def main():
-    if st.session_state.token is None:
-        render_auth_screen()
+MAX_TOOL_RESPONSE_VALUES = 50   # cap on values returned per get_column_values call
+
+
+def _prune_schema(schema: Dict[str, Any], question: str) -> Dict[str, Any]:
+    """
+    Return a leaner copy of the schema containing only tables/columns/measures
+    that are plausibly relevant to the question.
+
+    Strategy:
+      - Always keep tables whose name matches a question keyword
+      - Always keep all measures (they're small and any could be needed)
+      - For tables that don't match by name, keep them only if at least one
+        of their columns/measures matches a question keyword
+      - Strip the 'expression' field from measures (saves tokens, Gemini doesn't need it)
+
+    If no tables survive pruning (very abstract question), return the full schema
+    so Gemini still has something to work with.
+    """
+    terms = set(_extract_search_terms(question))
+    # Always keep calendar/date tables — almost every query needs them
+    date_keywords = {"calendar", "date", "time", "period", "year", "month", "quarter"}
+
+    pruned_tables = []
+    for table in schema.get("tables", []):
+        tname = _normalize_compact(table.get("name", ""))
+
+        # Slim down measures — drop expression, keep name/description/format
+        slim_measures = [
+            {k: v for k, v in m.items() if k != "expression"}
+            for m in table.get("measures", [])
+        ]
+
+        slim_table = {
+            **{k: v for k, v in table.items() if k not in ("columns", "measures")},
+            "columns":  table.get("columns", []),
+            "measures": slim_measures,
+        }
+
+        # Always include if table name matches a term or is a date/calendar table
+        if any(t in tname for t in terms) or any(d in tname for d in date_keywords):
+            pruned_tables.append(slim_table)
+            continue
+
+        # Include if any column or measure name matches a term
+        all_names = (
+            [_normalize_compact(c.get("name", "")) for c in table.get("columns", [])]
+            + [_normalize_compact(m.get("name", "")) for m in table.get("measures", [])]
+        )
+        if any(any(t in n for t in terms) for n in all_names if n):
+            pruned_tables.append(slim_table)
+
+    if not pruned_tables:
+        # Fallback: return schema with just measure expressions stripped
+        return {
+            **schema,
+            "tables": [
+                {**t, "measures": [{k: v for k, v in m.items() if k != "expression"}
+                                   for m in t.get("measures", [])]}
+                for t in schema.get("tables", [])
+            ],
+        }
+
+    return {**schema, "tables": pruned_tables}
+
+
+def build_dax_instruction(schema: Dict[str, Any], question: str,
+                          prior_dax: str = "", error_msg: str = "") -> str:
+    prompt = DAX_SYSTEM_PROMPT.format(max_rows=MAX_ROWS_RETURNED)
+    # Prune schema to only relevant tables before serialising
+    lean_schema = _prune_schema(schema, question)
+    parts = [
+        prompt,
+        "\n\nSCHEMA:\n" + json.dumps(lean_schema, ensure_ascii=False, indent=2),
+        "\n\nQUESTION:\n" + question,
+    ]
+    if prior_dax and error_msg:
+        parts.append(
+            f"\n\nPREVIOUS ATTEMPT FAILED — fix the query below.\n"
+            f"FAILED DAX:\n{prior_dax}\n\n"
+            f"ERROR FROM POWER BI API:\n{error_msg}\n\n"
+            f"Common causes of '[Measure] cannot be determined' errors:\n"
+            f"  - You used DEFINE MEASURE to wrap an existing model measure (never do this)\n"
+            f"  - You referenced [Measure] inside FILTER() without a surrounding table context\n"
+            f"  - Solution: use [Measure Name] directly inside SUMMARIZECOLUMNS, no DEFINE needed\n\n"
+            f"Produce a corrected version. Return JSON only."
+        )
     else:
-        render_chat()
+        parts.append("\n\nReturn JSON only.")
+    return "".join(parts)
 
 
-main()
+ANSWER_SYSTEM_PROMPT = """
+You are a business analyst presenting query results to an executive.
+The data rows below were returned directly from a live database query that already
+applied all the correct filters. Trust the data completely — if rows are present,
+the data exists. Never say information is missing, unavailable, or not found.
+Simply read the values from the rows and present them clearly.
+One direct sentence first, then bullet points if there are multiple items.
+Format numbers with commas. Do not invent values not in the data.
+""".strip()
+
+
+def build_answer_instruction(question: str, df: pd.DataFrame) -> str:
+    sample = df.head(MAX_ROWS_TO_LLM).to_dict(orient="records")
+    columns_hint = ", ".join(f'"{c}"' for c in df.columns)
+    return (
+        ANSWER_SYSTEM_PROMPT
+        + f"\n\nQ: {question}"
+        + f"\n\nColumns in the result: {columns_hint}"
+        + f"\n\nDATA ({len(sample)} row(s) — all values are real and correct):\n"
+        + json.dumps(sample, ensure_ascii=False, default=str, separators=(",", ":"))
+        + "\n\nA:"
+    )
+
+
+def parse_json_strict(text: str) -> Dict[str, Any]:
+    text = text.strip()
+    # Strip markdown code fences if the model added them despite instructions
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if not m:
+            raise ValueError(f"No JSON object found in model output:\n{text[:300]}")
+        return json.loads(m.group(0))
+
+
+# ──────────────────────────────────────────
+# Pipeline: question → DAX → data → answer
+# ──────────────────────────────────────────
+
+DAX_MAX_RETRIES = 3  # how many times to ask Gemini to fix a broken DAX
+
+
+def _extract_pbi_error(exc: RuntimeError) -> str:
+    """Pull the human-readable detail message out of a Power BI 400 error."""
+    text = str(exc)
+    # Try to parse the JSON body embedded in the RuntimeError message
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if not m:
+        return text
+    try:
+        body = json.loads(m.group(0))
+        details = (
+            body.get("error", {})
+                .get("pbi.error", {})
+                .get("details", [])
+        )
+        messages = [d["detail"]["value"] for d in details if "detail" in d]
+        return "\n".join(messages) if messages else text
+    except Exception:
+        return text
+
+
+def ask(question: str, schema: Dict[str, Any], token: str) -> str:
+    """
+    Full pipeline for one question. Returns the natural-language answer.
+    Token usage is accumulated across all Gemini calls and flushed to CSV at the end.
+    """
+    begin_question(question)
+    prior_dax = ""
+    error_msg = ""
+    success   = False
+
+    try:
+        for attempt in range(1, DAX_MAX_RETRIES + 1):
+
+            # ── Step 1: Generate (or fix) DAX ────────────────────────────────────
+            if attempt == 1:
+                print("\n[1/3] Generating DAX query…")
+                raw = run_function_calling_turn(question, schema, token)
+            else:
+                print(f"\n[1/3] Fixing DAX query (attempt {attempt}/{DAX_MAX_RETRIES})…")
+                raw = generate_response(
+                    build_dax_instruction(schema, question, prior_dax, error_msg)
+                )
+
+            try:
+                obj = parse_json_strict(raw)
+            except (ValueError, json.JSONDecodeError) as exc:
+                return (
+                    f"❌ Could not parse model output as JSON: {exc}"
+                    f"\n\nRaw output:\n{raw[:500]}"
+                )
+
+            dax   = obj.get("dax", "").strip()
+            notes = obj.get("notes", "")
+
+            if "EVALUATE" not in dax.upper():
+                return f"❌ Generated DAX contains no EVALUATE statement:\n{dax[:300]}"
+
+            print(f"   Notes: {notes}")
+            print(f"   DAX:\n{textwrap.indent(dax, '   ')}")
+
+            # ── Step 2: Execute DAX ───────────────────────────────────────────────
+            print("\n[2/3] Executing DAX on Power BI…")
+            try:
+                result_json = execute_dax(token, dax)
+                break
+            except RuntimeError as exc:
+                error_msg = _extract_pbi_error(exc)
+                prior_dax = dax
+                print(f"   ⚠️  Power BI error (attempt {attempt}): {error_msg}")
+                if attempt == DAX_MAX_RETRIES:
+                    return (
+                        f"❌ DAX failed after {DAX_MAX_RETRIES} attempts.\n"
+                        f"Last error: {error_msg}"
+                    )
+                continue
+
+        df = result_to_dataframe(result_json)
+        if df.empty:
+            return "ℹ️ The query returned no rows."
+
+        print(f"   Returned {len(df)} row(s), {len(df.columns)} column(s).")
+
+        # ── Step 3: Summarise ─────────────────────────────────────────────────────
+        print("\n[3/3] Summarising results…")
+        answer  = generate_response(build_answer_instruction(question, df))
+        success = True
+        return answer
+
+    finally:
+        flush_tokens(success=success)
+
+
+# ──────────────────────────────────────────
+# CLI entry point
+# ──────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="Power BI Chatbot (Gemini + DAX)")
+    parser.add_argument("--once", metavar="QUESTION", help="Ask one question and exit")
+    parser.add_argument(
+        "--auth",
+        choices=["auto", "env", "powershell", "devicecode"],
+        default="auto",
+        help="Authentication method (default: auto)",
+    )
+    args = parser.parse_args()
+
+    # Load schema
+    with open(SCHEMA_PATH, "r", encoding="utf-8") as f:
+        schema = json.load(f)
+
+    # Authenticate once
+    token = acquire_token(args.auth)
+    print("[auth] Token acquired ✓\n")
+
+    if args.once:
+        print(f"QUESTION: {args.once}")
+        print("\nANSWER:")
+        print(ask(args.once, schema, token))
+        return
+
+    # Interactive chat loop
+    print("Power BI Chatbot — type 'exit' to quit.\n")
+    while True:
+        try:
+            question = input("You: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+
+        if not question:
+            continue
+        if question.lower() in {"exit", "quit", "q"}:
+            break
+
+        answer = ask(question, schema, token)
+        print(f"\nBot: {answer}\n")
+
+
+if __name__ == "__main__":
+    main()

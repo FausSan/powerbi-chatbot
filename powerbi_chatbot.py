@@ -68,116 +68,47 @@ MAX_ROWS_TO_LLM   = 100   # rows forwarded to Gemini for summarisation
 # Authentication
 # ──────────────────────────────────────────
 
-def _token_from_env() -> Optional[str]:
-    """Read a pre-obtained token from the environment."""
-    return os.environ.get("POWERBI_TOKEN") or None
+# ──────────────────────────────────────────
+# Authentication (Service Principal ONLY)
+# ──────────────────────────────────────────
 
-
-def _token_from_powershell() -> str:
+def _token_from_service_principal() -> str:
     """
-    Equivalent of:
-        Connect-PowerBIServiceAccount
-        $token = Get-PowerBIAccessToken
-    Requires the MicrosoftPowerBIMgmt module and PowerShell ≥ 5.
+    Production-safe authentication using Azure AD Service Principal.
+    Works in Streamlit Cloud, no user interaction required.
     """
-    ps_exe = "pwsh" if _command_exists("pwsh") else "powershell"
+    client_secret = os.environ.get("CLIENT_SECRET")
 
-    ps_script = textwrap.dedent("""
-        Import-Module MicrosoftPowerBIMgmt -ErrorAction Stop
-        Connect-PowerBIServiceAccount | Out-Null
-        $t = Get-PowerBIAccessToken
-        Write-Output $t["Authorization"]
-    """)
-
-    print("[auth] Launching PowerShell — a browser window will open for sign-in.")
-    result = subprocess.run(
-        # Remove -NonInteractive so the browser popup can appear
-        [ps_exe, "-NoProfile", "-Command", ps_script],
-        capture_output=True, text=True
-    )
-
-    if result.returncode != 0:
+    if not client_secret:
         raise RuntimeError(
-            f"PowerShell auth failed.\nSTDERR: {result.stderr.strip()}"
+            "CLIENT_SECRET not set. This app requires Service Principal auth.\n"
+            "Set it in Streamlit secrets or environment variables."
         )
 
-    lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
-    if not lines:
-        raise RuntimeError("PowerShell returned no token output.")
-
-    header_value = lines[-1]
-    if not header_value.startswith("Bearer "):
-        raise RuntimeError(f"Unexpected token format: {header_value[:60]}")
-
-    return header_value.split(" ", 1)[1]
-
-
-def _token_from_device_code() -> str:
-    """
-    MSAL device-code flow — cross-platform, no popup browser.
-    Prints a short code; the user visits aka.ms/devicelogin to authenticate.
-    NOTE: Uses PublicClientApplication — no CLIENT_SECRET needed or used.
-    """
-    # Warn if CLIENT_SECRET is set — it is NOT used here and may indicate
-    # the user is confusing this with service principal auth.
-    if os.environ.get("CLIENT_SECRET"):
-        print("[auth] Warning: CLIENT_SECRET is set in your .env but is NOT used "
-              "for device-code or PowerShell auth. If you are seeing AADSTS errors, "
-              "make sure your Azure app registration allows public client flows.")
-
-    app = msal.PublicClientApplication(
+    app = msal.ConfidentialClientApplication(
         client_id=CLIENT_ID,
+        client_credential=client_secret,
         authority=f"https://login.microsoftonline.com/{TENANT_ID}",
     )
 
-    flow = app.initiate_device_flow(scopes=[f"{POWERBI_RESOURCE}/.default"])
-    if "user_code" not in flow:
-        raise RuntimeError(f"Device-code flow failed: {flow}")
+    result = app.acquire_token_for_client(
+        scopes=[f"{POWERBI_RESOURCE}/.default"]
+    )
 
-    print(flow["message"])
-
-    result = app.acquire_token_by_device_flow(flow)
     if "access_token" not in result:
         raise RuntimeError(
-            f"Device-code auth failed: {result.get('error_description', result)}"
+            f"Service Principal auth failed:\n{result}"
         )
 
     return result["access_token"]
 
 
-def _command_exists(cmd: str) -> bool:
-    import shutil
-    return shutil.which(cmd) is not None
-
-
 def acquire_token(method: str = "auto") -> str:
     """
-    method: "auto" | "env" | "powershell" | "devicecode"
+    Always uses Service Principal in production.
     """
-    if method == "auto":
-        token = _token_from_env()
-        if token:
-            print("[auth] Using token from POWERBI_TOKEN env var.")
-            return token
-        if _command_exists("powershell") or _command_exists("pwsh"):
-            print("[auth] PowerShell found — using PowerShell auth.")
-            return _token_from_powershell()
-        print("[auth] Falling back to device-code flow.")
-        return _token_from_device_code()
-
-    if method == "env":
-        token = _token_from_env()
-        if not token:
-            raise RuntimeError("POWERBI_TOKEN env var is not set.")
-        return token
-
-    if method == "powershell":
-        return _token_from_powershell()
-
-    if method == "devicecode":
-        return _token_from_device_code()
-
-    raise ValueError(f"Unknown auth method: {method}")
+    print("[auth] Using Service Principal authentication.")
+    return _token_from_service_principal()
 
 
 # ──────────────────────────────────────────

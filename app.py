@@ -1,15 +1,24 @@
+"""
+app.py — Streamlit frontend for the Power BI Chatbot
+=====================================================
+Run:
+    streamlit run app.py
+    streamlit run app.py -- --auth devicecode   # force auth method
+
+Requires powerbi_chatbot.py to be in the same directory.
+"""
+
 import sys
 import json
 import textwrap
 import argparse
 import streamlit as st
 import pandas as pd
-
+from auth import acquire_token
 # ── Import backend ──────────────────────────────────────────────────────────
 # We import the chatbot module but override ask() to also return the
 # intermediate DAX and dataframe for display in the UI.
 from powerbi_chatbot import (
-    acquire_token,
     ask,
     execute_dax,
     result_to_dataframe,
@@ -708,25 +717,10 @@ def render_chat():
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main():
-    # Auto-authenticate on first load
     if st.session_state.token is None:
-        with st.spinner("Connecting to Power BI…"):
-            try:
-                token  = acquire_token("auto")
-                schema = json.load(open(SCHEMA_PATH, encoding="utf-8"))
-
-                st.session_state.token  = token
-                st.session_state.schema = schema
-                st.session_state.auth_error = None
-
-                st.rerun()
-
-            except Exception as exc:
-                st.error(f"❌ Failed to connect:\n\n{exc}")
-                st.stop()
-
-    # If authenticated → go to chat
-    render_chat()
+        render_auth_screen()
+    else:
+        render_chat()
 
 
 main()

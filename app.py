@@ -392,6 +392,8 @@ if "session_tokens" not in st.session_state:
     st.session_state.session_tokens = {"input": 0, "output": 0}
 if "device_flow" not in st.session_state:
     st.session_state.device_flow = None
+if "device_flow_app" not in st.session_state:
+    st.session_state.device_flow_app = None
 if "device_flow_result" not in st.session_state:
     st.session_state.device_flow_result = None
 
@@ -587,11 +589,10 @@ def _command_exists(cmd: str) -> bool:
 def _start_device_code_flow():
     """
     Starts MSAL device-code flow using the well-known Power BI public client.
+    Stores the flow and app object in session state for polling in the main thread.
     No app registration required — same client the PowerShell module uses.
-    Spawns a background thread to poll for the token.
     """
     import msal as _msal
-    import threading
 
     POWERBI_PUBLIC_CLIENT_ID = "ea0616ba-638b-4df5-95b9-636659ae5121"
     app = _msal.PublicClientApplication(
@@ -604,22 +605,10 @@ def _start_device_code_flow():
     if "user_code" not in flow:
         raise RuntimeError(f"Could not start device-code flow: {flow}")
 
+    # Store both app and flow — we'll poll from the main Streamlit thread
     st.session_state.device_flow        = flow
+    st.session_state.device_flow_app    = app
     st.session_state.device_flow_result = "pending"
-
-    def _poll():
-        try:
-            result = app.acquire_token_by_device_flow(flow)
-            if "access_token" in result:
-                st.session_state.device_flow_result = result["access_token"]
-            else:
-                st.session_state.device_flow_result = (
-                    f"error:{result.get('error_description', 'Unknown error')}"
-                )
-        except Exception as exc:
-            st.session_state.device_flow_result = f"error:{exc}"
-
-    threading.Thread(target=_poll, daemon=True).start()
 
 
 # ── Auth screen ───────────────────────────────────────────────────────────────
@@ -695,7 +684,30 @@ def render_auth_screen():
             </div>
         </div>
         """, unsafe_allow_html=True)
-        time.sleep(3)
+
+        # Poll directly in the main thread with a short timeout
+        # acquire_token_by_device_flow blocks until done or expired,
+        # so we use the non-blocking check via initiate_device_flow's expires_in
+        app = st.session_state.get("device_flow_app")
+        if app:
+            try:
+                # Try to acquire with a 4-second window — if not ready yet,
+                # MSAL raises or returns an error dict we can check
+                result = app.acquire_token_by_device_flow(
+                    {**flow, "expires_in": 4}  # short poll window
+                )
+                if "access_token" in result:
+                    st.session_state.device_flow_result = result["access_token"]
+                elif result.get("error") == "authorization_pending":
+                    pass  # still waiting — rerun and show code again
+                else:
+                    st.session_state.device_flow_result = (
+                        f"error:{result.get('error_description', result.get('error', 'Unknown'))}"
+                    )
+            except Exception:
+                pass  # timeout or pending — just rerun
+
+        time.sleep(2)
         st.rerun()
         return
 

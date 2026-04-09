@@ -390,6 +390,10 @@ if "pending_question" not in st.session_state:
     st.session_state.pending_question = None
 if "session_tokens" not in st.session_state:
     st.session_state.session_tokens = {"input": 0, "output": 0}
+if "device_flow" not in st.session_state:
+    st.session_state.device_flow = None
+if "device_flow_result" not in st.session_state:
+    st.session_state.device_flow_result = None
 
 
 # ── Ask with metadata ────────────────────────────────────────────────────────
@@ -580,6 +584,44 @@ def _command_exists(cmd: str) -> bool:
     return shutil.which(cmd) is not None
 
 
+def _start_device_code_flow():
+    """
+    Starts MSAL device-code flow using the well-known Power BI public client.
+    No app registration required — same client the PowerShell module uses.
+    Spawns a background thread to poll for the token.
+    """
+    import msal as _msal
+    import threading
+
+    POWERBI_PUBLIC_CLIENT_ID = "ea0616ba-638b-4df5-95b9-636659ae5121"
+    app = _msal.PublicClientApplication(
+        client_id=POWERBI_PUBLIC_CLIENT_ID,
+        authority="https://login.microsoftonline.com/organizations",
+    )
+    flow = app.initiate_device_flow(
+        scopes=["https://analysis.windows.net/powerbi/api/.default"]
+    )
+    if "user_code" not in flow:
+        raise RuntimeError(f"Could not start device-code flow: {flow}")
+
+    st.session_state.device_flow        = flow
+    st.session_state.device_flow_result = "pending"
+
+    def _poll():
+        try:
+            result = app.acquire_token_by_device_flow(flow)
+            if "access_token" in result:
+                st.session_state.device_flow_result = result["access_token"]
+            else:
+                st.session_state.device_flow_result = (
+                    f"error:{result.get('error_description', 'Unknown error')}"
+                )
+        except Exception as exc:
+            st.session_state.device_flow_result = f"error:{exc}"
+
+    threading.Thread(target=_poll, daemon=True).start()
+
+
 # ── Auth screen ───────────────────────────────────────────────────────────────
 def render_auth_screen():
     st.markdown("""
@@ -587,12 +629,13 @@ def render_auth_screen():
         <div class="auth-icon">🔐</div>
         <div class="auth-title">Connect to Microsoft Fabric</div>
         <div class="auth-desc">
-            Sign in to start querying your Fabric dataset in natural language.
+            Sign in with your Microsoft account to start querying your
+            Fabric dataset in natural language.
         </div>
     </div>
     """, unsafe_allow_html=True)
 
-    # ── Option A: POWERBI_TOKEN already in env/secrets (cloud deployment) ─────
+    # ── Env token in Streamlit secrets — silent auto-login ────────────────────
     env_token = os.environ.get("POWERBI_TOKEN")
     if env_token:
         try:
@@ -601,83 +644,86 @@ def render_auth_screen():
             st.session_state.schema = schema
             st.rerun()
         except Exception as exc:
-            st.error(f"Token found but failed to load schema: {exc}")
+            st.error(f"Token found in secrets but failed to load schema: {exc}")
         return
 
-    # ── Option B: PowerShell available (local Windows) ────────────────────────
-    if _command_exists("powershell") or _command_exists("pwsh"):
-        col1, col2, col3 = st.columns([1, 1.2, 1])
-        with col2:
-            if st.button("Sign in with Microsoft", use_container_width=True):
+    # ── Device-code token arrived ─────────────────────────────────────────────
+    flow_result = st.session_state.get("device_flow_result")
+    flow        = st.session_state.get("device_flow")
+
+    if flow_result and flow_result not in ("pending",) \
+            and not flow_result.startswith("error:"):
+        try:
+            schema = json.load(open(SCHEMA_PATH, encoding="utf-8"))
+            st.session_state.token              = flow_result
+            st.session_state.schema             = schema
+            st.session_state.device_flow        = None
+            st.session_state.device_flow_result = None
+            st.rerun()
+        except Exception as exc:
+            st.session_state.auth_error = str(exc)
+        return
+
+    # ── Device-code error ─────────────────────────────────────────────────────
+    if flow_result and flow_result.startswith("error:"):
+        st.error("Sign-in failed: " + flow_result.removeprefix("error:"))
+        st.session_state.device_flow        = None
+        st.session_state.device_flow_result = None
+
+    # ── Waiting for user to complete sign-in ──────────────────────────────────
+    if flow and flow_result == "pending":
+        st.markdown(f"""
+        <div style="max-width:460px;margin:0 auto;background:#0d1117;
+                    border:1px solid #1e2940;border-radius:12px;
+                    padding:32px;text-align:center;">
+            <div style="font-size:13px;color:#8b949e;margin-bottom:20px;line-height:1.6;">
+                Open
+                <a href="https://microsoft.com/devicelogin" target="_blank"
+                   style="color:#f2c811;text-decoration:none;font-weight:600;">
+                   microsoft.com/devicelogin</a>
+                and enter this code:
+            </div>
+            <div style="font-family:'IBM Plex Mono',monospace;font-size:36px;
+                        font-weight:600;color:#e6edf3;letter-spacing:8px;
+                        background:#060a10;padding:18px 28px;border-radius:8px;
+                        border:1px solid #30363d;display:inline-block;
+                        margin-bottom:24px;">
+                {flow["user_code"]}
+            </div>
+            <div style="font-size:12px;color:#484f58;">
+                Waiting for sign-in… refreshing automatically.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        time.sleep(3)
+        st.rerun()
+        return
+
+    # ── Initial button ────────────────────────────────────────────────────────
+    # Local Windows: PowerShell browser popup (fast, seamless)
+    # Streamlit Cloud / Linux: device-code shown on screen
+    col1, col2, col3 = st.columns([1, 1.2, 1])
+    with col2:
+        if st.button("Sign in with Microsoft", use_container_width=True):
+            if _command_exists("powershell") or _command_exists("pwsh"):
                 with st.spinner("Opening browser for sign-in…"):
                     try:
                         token  = acquire_token("powershell")
                         schema = json.load(open(SCHEMA_PATH, encoding="utf-8"))
                         st.session_state.token  = token
                         st.session_state.schema = schema
-                        st.session_state.auth_error = None
                         st.rerun()
                     except Exception as exc:
                         st.session_state.auth_error = str(exc)
-
-        if st.session_state.auth_error:
-            st.error(f"Authentication failed: {st.session_state.auth_error}")
-
-        # Also show manual paste option as fallback
-        with st.expander("Or paste a token manually"):
-            _render_token_paste()
-        return
-
-    # ── Option C: Cloud — no PowerShell, show token paste UI ─────────────────
-    st.markdown("""
-    <div style="max-width:480px;margin:0 auto 24px auto;background:#0d1117;
-                border:1px solid #1e2940;border-radius:12px;padding:24px;">
-        <div style="font-size:13px;color:#8b949e;line-height:1.7;margin-bottom:16px;">
-            Run this in PowerShell to get your Fabric access token:
-        </div>
-        <div style="font-family:'IBM Plex Mono',monospace;font-size:12px;color:#79c0ff;
-                    background:#060a10;border:1px solid #1e2940;border-radius:8px;
-                    padding:14px;white-space:pre;">Connect-PowerBIServiceAccount
-$t = Get-PowerBIAccessToken
-$t["Authorization"]</div>
-        <div style="font-size:12px;color:#484f58;margin-top:12px;">
-            Copy the value that starts with <code style="color:#f2c811;">Bearer eyJ…</code>
-            and paste it below (with or without the "Bearer " prefix).
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    _render_token_paste()
-
-
-def _render_token_paste():
-    """Shared widget: paste a raw Bearer token to authenticate."""
-    token_input = st.text_area(
-        "Access token",
-        placeholder="Bearer eyJ0eXAiOiJKV1Qi… (or just the eyJ… part)",
-        height=100,
-        label_visibility="collapsed",
-    )
-    col1, col2, col3 = st.columns([1, 1.2, 1])
-    with col2:
-        if st.button("Connect", use_container_width=True, key="paste_connect"):
-            raw = token_input.strip()
-            if not raw:
-                st.warning("Please paste a token first.")
-                return
-            # Accept with or without "Bearer " prefix
-            token = raw.removeprefix("Bearer ").strip()
-            try:
-                schema = json.load(open(SCHEMA_PATH, encoding="utf-8"))
-                st.session_state.token  = token
-                st.session_state.schema = schema
-                st.session_state.auth_error = None
-                st.rerun()
-            except Exception as exc:
-                st.session_state.auth_error = str(exc)
+            else:
+                try:
+                    _start_device_code_flow()
+                    st.rerun()
+                except Exception as exc:
+                    st.session_state.auth_error = str(exc)
 
     if st.session_state.auth_error:
-        st.error(f"Error: {st.session_state.auth_error}")
+        st.error(f"Authentication failed: {st.session_state.auth_error}")
 
 
 # ── Main chat UI ──────────────────────────────────────────────────────────────

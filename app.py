@@ -9,9 +9,11 @@ Requires powerbi_chatbot.py to be in the same directory.
 """
 
 import sys
+import os
 import json
-import textwrap
+import time
 import argparse
+import threading
 import streamlit as st
 import pandas as pd
 
@@ -387,7 +389,14 @@ if "auth_error" not in st.session_state:
 if "pending_question" not in st.session_state:
     st.session_state.pending_question = None
 if "session_tokens" not in st.session_state:
-    st.session_state.session_tokens = {"input": 0, "output": 0}  # cumulative for this session
+    st.session_state.session_tokens = {"input": 0, "output": 0}
+# Device-code flow state — stored so the UI can show the code while waiting
+if "device_flow" not in st.session_state:
+    st.session_state.device_flow = None   # the MSAL flow dict
+if "device_flow_thread" not in st.session_state:
+    st.session_state.device_flow_thread = None
+if "device_flow_result" not in st.session_state:
+    st.session_state.device_flow_result = None  # "pending" | token_str | "error:..."
 
 
 # ── Ask with metadata ────────────────────────────────────────────────────────
@@ -572,6 +581,54 @@ def render_message(msg: dict):
                 )
 
 
+# ── Auth helpers ─────────────────────────────────────────────────────────────
+import threading
+import msal as _msal
+
+POWERBI_RESOURCE = "https://analysis.windows.net/powerbi/api"
+
+
+def _is_cloud() -> bool:
+    """Detect Streamlit Cloud — no PowerShell available."""
+    return not (_command_exists("powershell") or _command_exists("pwsh"))
+
+
+def _start_device_code_flow():
+    """Initiate MSAL device-code flow and store the flow object in session state."""
+    from powerbi_chatbot import CLIENT_ID, TENANT_ID
+    app = _msal.PublicClientApplication(
+        client_id=CLIENT_ID,
+        authority=f"https://login.microsoftonline.com/{TENANT_ID}",
+    )
+    flow = app.initiate_device_flow(scopes=[f"{POWERBI_RESOURCE}/.default"])
+    if "user_code" not in flow:
+        raise RuntimeError(f"Could not start device-code flow: {flow}")
+    st.session_state.device_flow = flow
+    st.session_state.device_flow_result = "pending"
+
+    # Poll for the token in a background thread so the UI stays responsive
+    def _poll():
+        try:
+            result = app.acquire_token_by_device_flow(flow)
+            if "access_token" in result:
+                st.session_state.device_flow_result = result["access_token"]
+            else:
+                st.session_state.device_flow_result = (
+                    f"error:{result.get('error_description', 'Unknown error')}"
+                )
+        except Exception as exc:
+            st.session_state.device_flow_result = f"error:{exc}"
+
+    t = threading.Thread(target=_poll, daemon=True)
+    t.start()
+    st.session_state.device_flow_thread = t
+
+
+def _command_exists(cmd: str) -> bool:
+    import shutil
+    return shutil.which(cmd) is not None
+
+
 # ── Auth screen ───────────────────────────────────────────────────────────────
 def render_auth_screen():
     st.markdown("""
@@ -585,20 +642,100 @@ def render_auth_screen():
     </div>
     """, unsafe_allow_html=True)
 
-    col1, col2, col3 = st.columns([1, 1.2, 1])
-    with col2:
-        if st.button("Sign in with Microsoft", use_container_width=True):
-            with st.spinner("Authenticating…"):
+    # ── Option 1: env token (always available) ────────────────────────────────
+    env_token = os.environ.get("POWERBI_TOKEN")
+    if env_token:
+        st.info("A POWERBI_TOKEN env var was found. Click below to use it directly.")
+        col1, col2, col3 = st.columns([1, 1.2, 1])
+        with col2:
+            if st.button("Use env token", use_container_width=True):
                 try:
-                    auth_method = _get_auth_method()
-                    token  = acquire_token(auth_method)
                     schema = json.load(open(SCHEMA_PATH, encoding="utf-8"))
-                    st.session_state.token  = token
+                    st.session_state.token  = env_token
                     st.session_state.schema = schema
-                    st.session_state.auth_error = None
                     st.rerun()
                 except Exception as exc:
                     st.session_state.auth_error = str(exc)
+        return
+
+    # ── Option 2: PowerShell (local Windows only) ─────────────────────────────
+    if not _is_cloud():
+        col1, col2, col3 = st.columns([1, 1.2, 1])
+        with col2:
+            if st.button("Sign in with Microsoft", use_container_width=True):
+                with st.spinner("Opening browser for sign-in…"):
+                    try:
+                        token  = acquire_token("powershell")
+                        schema = json.load(open(SCHEMA_PATH, encoding="utf-8"))
+                        st.session_state.token  = token
+                        st.session_state.schema = schema
+                        st.session_state.auth_error = None
+                        st.rerun()
+                    except Exception as exc:
+                        st.session_state.auth_error = str(exc)
+
+        if st.session_state.auth_error:
+            st.error(f"Authentication failed: {st.session_state.auth_error}")
+        return
+
+    # ── Option 3: Device-code flow (cloud / no PowerShell) ───────────────────
+    flow_result = st.session_state.device_flow_result
+    flow        = st.session_state.device_flow
+
+    # Token arrived — finalise login
+    if flow_result and not flow_result.startswith("error:") and flow_result != "pending":
+        try:
+            schema = json.load(open(SCHEMA_PATH, encoding="utf-8"))
+            st.session_state.token        = flow_result
+            st.session_state.schema       = schema
+            st.session_state.device_flow  = None
+            st.session_state.device_flow_result = None
+            st.rerun()
+        except Exception as exc:
+            st.session_state.auth_error = str(exc)
+        return
+
+    # Error during device-code flow
+    if flow_result and flow_result.startswith("error:"):
+        st.error(flow_result.replace("error:", "Authentication failed: "))
+        st.session_state.device_flow        = None
+        st.session_state.device_flow_result = None
+
+    # Show the code to the user while waiting
+    if flow and flow_result == "pending":
+        st.markdown(f"""
+        <div style="background:#0d1117;border:1px solid #1e2940;border-radius:12px;
+                    padding:28px;text-align:center;max-width:440px;margin:0 auto;">
+            <div style="font-size:13px;color:#8b949e;margin-bottom:16px;">
+                Go to <strong style="color:#f2c811;">aka.ms/devicelogin</strong>
+                and enter this code:
+            </div>
+            <div style="font-family:'IBM Plex Mono',monospace;font-size:32px;
+                        font-weight:600;color:#e6edf3;letter-spacing:6px;
+                        background:#060a10;padding:16px 24px;border-radius:8px;
+                        border:1px solid #30363d;display:inline-block;margin-bottom:20px;">
+                {flow["user_code"]}
+            </div>
+            <div style="font-size:12px;color:#484f58;">
+                Waiting for sign-in… this page will refresh automatically.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Poll every 3 seconds
+        time.sleep(3)
+        st.rerun()
+        return
+
+    # Initial state — show the "Sign in" button to kick off device-code flow
+    col1, col2, col3 = st.columns([1, 1.2, 1])
+    with col2:
+        if st.button("Sign in with Microsoft", use_container_width=True):
+            try:
+                _start_device_code_flow()
+                st.rerun()
+            except Exception as exc:
+                st.session_state.auth_error = str(exc)
 
     if st.session_state.auth_error:
         st.error(f"Authentication failed: {st.session_state.auth_error}")
@@ -617,7 +754,7 @@ def render_chat():
         <div class="pbi-logo">📊</div>
         <div>
             <div class="pbi-title">PBI Analyst</div>
-            <div class="pbi-subtitle">Gemini · Power BI · Natural Language</div>
+            <div class="pbi-subtitle">GPT · Power BI · Natural Language</div>
         </div>
         <div class="token-counter">
             <div class="token-stat">

@@ -52,7 +52,7 @@ AZURE_OPENAI_ENDPOINT   = os.environ["AZURE_OPENAI_ENDPOINT"]
 AZURE_OPENAI_API_KEY    = os.environ["AZURE_OPENAI_API_KEY"]
 AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
 AZURE_OPENAI_API_VERSION= os.environ.get("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
-SCHEMA_PATH             = os.environ.get("SCHEMA_PATH", "semantic_model.json")
+SCHEMA_PATH             = os.environ.get("SCHEMA_PATH", "schema/semantic_model.json")
 
 POWERBI_RESOURCE = "https://analysis.windows.net/powerbi/api"
 EXECUTE_DAX_URL  = (
@@ -114,23 +114,20 @@ def _token_from_powershell() -> str:
 
 def _token_from_device_code() -> str:
     """
-    MSAL device-code flow — cross-platform, no popup browser.
-    Prints a short code; the user visits aka.ms/devicelogin to authenticate.
-    NOTE: Uses PublicClientApplication — no CLIENT_SECRET needed or used.
+    MSAL device-code flow using the same well-known Power BI public client
+    that the MicrosoftPowerBIMgmt PowerShell module uses internally.
+    No app registration required — works with any Fabric/Power BI account.
     """
-    # Warn if CLIENT_SECRET is set — it is NOT used here and may indicate
-    # the user is confusing this with service principal auth.
-    if os.environ.get("CLIENT_SECRET"):
-        print("[auth] Warning: CLIENT_SECRET is set in your .env but is NOT used "
-              "for device-code or PowerShell auth. If you are seeing AADSTS errors, "
-              "make sure your Azure app registration allows public client flows.")
+    # This is the well-known Power BI Desktop / PowerShell module public client ID.
+    # It has Power BI permissions pre-consented by Microsoft — no app registration needed.
+    POWERBI_PUBLIC_CLIENT_ID = "ea0616ba-638b-4df5-95b9-636659ae5121"
 
     app = msal.PublicClientApplication(
-        client_id=CLIENT_ID,
-        authority=f"https://login.microsoftonline.com/{TENANT_ID}",
+        client_id=POWERBI_PUBLIC_CLIENT_ID,
+        authority="https://login.microsoftonline.com/organizations",
     )
 
-    flow = app.initiate_device_flow(scopes=[f"{POWERBI_RESOURCE}/.default"])
+    flow = app.initiate_device_flow(scopes=["https://analysis.windows.net/powerbi/api/.default"])
     if "user_code" not in flow:
         raise RuntimeError(f"Device-code flow failed: {flow}")
 

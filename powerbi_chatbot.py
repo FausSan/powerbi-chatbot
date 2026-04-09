@@ -1,3 +1,26 @@
+"""
+Power BI Chatbot — Azure OpenAI GPT + DAX execution
+=====================================================
+Authentication options (in priority order):
+  1. POWERBI_TOKEN env var  — paste a token you obtained externally
+  2. PowerShell method      — calls Connect-PowerBIServiceAccount + Get-PowerBIAccessToken
+                              (requires MicrosoftPowerBIMgmt module, Windows only)
+  3. MSAL device-code flow  — cross-platform fallback, prints a code you enter in a browser
+
+Required .env vars:
+  AZURE_OPENAI_ENDPOINT    = https://your-resource.openai.azure.com/
+  AZURE_OPENAI_API_KEY     = your-api-key
+  AZURE_OPENAI_DEPLOYMENT  = gpt-4o          # your deployment name
+  AZURE_OPENAI_API_VERSION = 2024-02-15-preview
+
+Run:
+    python powerbi_chatbot.py                  # interactive chat loop
+    python powerbi_chatbot.py --once "question" # single question, then exit
+    python powerbi_chatbot.py --auth powershell # force PowerShell auth
+    python powerbi_chatbot.py --auth devicecode # force device-code auth
+    python powerbi_chatbot.py --auth env        # force env-var token
+"""
+
 import os
 import sys
 import json
@@ -27,9 +50,9 @@ DATASET_ID  = os.environ["DATASET_ID"]
 
 AZURE_OPENAI_ENDPOINT   = os.environ["AZURE_OPENAI_ENDPOINT"]
 AZURE_OPENAI_API_KEY    = os.environ["AZURE_OPENAI_API_KEY"]
-AZURE_OPENAI_DEPLOYMENT = os.environ["AZURE_OPENAI_DEPLOYMENT"]
-AZURE_OPENAI_API_VERSION= os.environ["AZURE_OPENAI_API_VERSION"]
-SCHEMA_PATH             = os.environ["SCHEMA_PATH"]
+AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
+AZURE_OPENAI_API_VERSION= os.environ.get("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
+SCHEMA_PATH             = os.environ.get("SCHEMA_PATH", "schema/semantic_model.json")
 
 POWERBI_RESOURCE = "https://analysis.windows.net/powerbi/api"
 EXECUTE_DAX_URL  = (
@@ -56,22 +79,20 @@ def _token_from_powershell() -> str:
         Connect-PowerBIServiceAccount
         $token = Get-PowerBIAccessToken
     Requires the MicrosoftPowerBIMgmt module and PowerShell ≥ 5.
-    Works on Windows; on macOS/Linux use PowerShell Core (pwsh).
     """
     ps_exe = "pwsh" if _command_exists("pwsh") else "powershell"
 
-    # One script: connect interactively, then print the Bearer token value.
     ps_script = textwrap.dedent("""
         Import-Module MicrosoftPowerBIMgmt -ErrorAction Stop
         Connect-PowerBIServiceAccount | Out-Null
         $t = Get-PowerBIAccessToken
-        # $t is a hashtable like @{ Authorization = "Bearer eyJ..." }
         Write-Output $t["Authorization"]
     """)
 
     print("[auth] Launching PowerShell — a browser window will open for sign-in.")
     result = subprocess.run(
-        [ps_exe, "-NoProfile", "-NonInteractive", "-Command", ps_script],
+        # Remove -NonInteractive so the browser popup can appear
+        [ps_exe, "-NoProfile", "-Command", ps_script],
         capture_output=True, text=True
     )
 
@@ -80,16 +101,14 @@ def _token_from_powershell() -> str:
             f"PowerShell auth failed.\nSTDERR: {result.stderr.strip()}"
         )
 
-    # The last non-empty line is "Bearer <token>"
     lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
     if not lines:
         raise RuntimeError("PowerShell returned no token output.")
 
-    header_value = lines[-1]  # e.g. "Bearer eyJ0eXAiOiJ..."
+    header_value = lines[-1]
     if not header_value.startswith("Bearer "):
         raise RuntimeError(f"Unexpected token format: {header_value[:60]}")
 
-    # Return only the raw token (without "Bearer " prefix)
     return header_value.split(" ", 1)[1]
 
 
@@ -97,7 +116,15 @@ def _token_from_device_code() -> str:
     """
     MSAL device-code flow — cross-platform, no popup browser.
     Prints a short code; the user visits aka.ms/devicelogin to authenticate.
+    NOTE: Uses PublicClientApplication — no CLIENT_SECRET needed or used.
     """
+    # Warn if CLIENT_SECRET is set — it is NOT used here and may indicate
+    # the user is confusing this with service principal auth.
+    if os.environ.get("CLIENT_SECRET"):
+        print("[auth] Warning: CLIENT_SECRET is set in your .env but is NOT used "
+              "for device-code or PowerShell auth. If you are seeing AADSTS errors, "
+              "make sure your Azure app registration allows public client flows.")
+
     app = msal.PublicClientApplication(
         client_id=CLIENT_ID,
         authority=f"https://login.microsoftonline.com/{TENANT_ID}",
@@ -107,11 +134,13 @@ def _token_from_device_code() -> str:
     if "user_code" not in flow:
         raise RuntimeError(f"Device-code flow failed: {flow}")
 
-    print(flow["message"])  # prints the URL + code to enter
+    print(flow["message"])
 
     result = app.acquire_token_by_device_flow(flow)
     if "access_token" not in result:
-        raise RuntimeError(f"Device-code auth failed: {result}")
+        raise RuntimeError(
+            f"Device-code auth failed: {result.get('error_description', result)}"
+        )
 
     return result["access_token"]
 
@@ -122,17 +151,33 @@ def _command_exists(cmd: str) -> bool:
 
 
 def acquire_token(method: str = "auto") -> str:
-    app = msal.ConfidentialClientApplication(
-        client_id=CLIENT_ID,
-        client_credential=os.environ["CLIENT_SECRET"],
-        authority=f"https://login.microsoftonline.com/{TENANT_ID}",
-    )
-    result = app.acquire_token_for_client(
-        scopes=["https://analysis.windows.net/powerbi/api/.default"]
-    )
-    if "access_token" not in result:
-        raise RuntimeError(f"Auth failed: {result.get('error_description')}")
-    return result["access_token"]
+    """
+    method: "auto" | "env" | "powershell" | "devicecode"
+    """
+    if method == "auto":
+        token = _token_from_env()
+        if token:
+            print("[auth] Using token from POWERBI_TOKEN env var.")
+            return token
+        if _command_exists("powershell") or _command_exists("pwsh"):
+            print("[auth] PowerShell found — using PowerShell auth.")
+            return _token_from_powershell()
+        print("[auth] Falling back to device-code flow.")
+        return _token_from_device_code()
+
+    if method == "env":
+        token = _token_from_env()
+        if not token:
+            raise RuntimeError("POWERBI_TOKEN env var is not set.")
+        return token
+
+    if method == "powershell":
+        return _token_from_powershell()
+
+    if method == "devicecode":
+        return _token_from_device_code()
+
+    raise ValueError(f"Unknown auth method: {method}")
 
 
 # ──────────────────────────────────────────
@@ -268,11 +313,22 @@ def _call_openai(messages: List[Dict], use_tools: bool = False) -> Any:
             _accumulate_tokens(response)
             return response
         except Exception as exc:
-            # Retry on rate limit or server errors
+            # Don't retry on configuration errors — fail fast with a clear message
+            err_str = str(exc)
+            if any(code in err_str for code in ["404", "401", "400", "NotFound", "Unauthorized", "DeploymentNotFound"]):
+                raise RuntimeError(
+                    f"Azure OpenAI configuration error: {exc}\n\n"
+                    f"Check these .env values:\n"
+                    f"  AZURE_OPENAI_ENDPOINT   = {AZURE_OPENAI_ENDPOINT}\n"
+                    f"  AZURE_OPENAI_DEPLOYMENT = {AZURE_OPENAI_DEPLOYMENT}\n"
+                    f"  AZURE_OPENAI_API_VERSION= {AZURE_OPENAI_API_VERSION}\n"
+                    f"  AZURE_OPENAI_API_KEY    = {'set' if AZURE_OPENAI_API_KEY else 'NOT SET'}"
+                ) from exc
+            # Retry on rate limits and server errors
             if attempt == 5:
                 raise
             wait = 2 ** attempt
-            print(f"[openai] Error ({exc.__class__.__name__}), retrying in {wait}s…")
+            print(f"[openai] Transient error ({exc.__class__.__name__}), retrying in {wait}s…")
             time.sleep(wait)
 
 

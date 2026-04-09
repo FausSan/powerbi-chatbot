@@ -52,7 +52,7 @@ AZURE_OPENAI_ENDPOINT   = os.environ["AZURE_OPENAI_ENDPOINT"]
 AZURE_OPENAI_API_KEY    = os.environ["AZURE_OPENAI_API_KEY"]
 AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
 AZURE_OPENAI_API_VERSION= os.environ.get("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
-SCHEMA_PATH             = os.environ.get("SCHEMA_PATH", "schema/semantic_model.json")
+SCHEMA_PATH             = os.environ.get("SCHEMA_PATH", "semantic_model.json")
 
 POWERBI_RESOURCE = "https://analysis.windows.net/powerbi/api"
 EXECUTE_DAX_URL  = (

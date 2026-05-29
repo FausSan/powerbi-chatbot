@@ -1,26 +1,3 @@
-"""
-Power BI Chatbot — Azure OpenAI GPT + DAX execution
-=====================================================
-Authentication options (in priority order):
-  1. POWERBI_TOKEN env var  — paste a token you obtained externally
-  2. PowerShell method      — calls Connect-PowerBIServiceAccount + Get-PowerBIAccessToken
-                              (requires MicrosoftPowerBIMgmt module, Windows only)
-  3. MSAL device-code flow  — cross-platform fallback, prints a code you enter in a browser
-
-Required .env vars:
-  AZURE_OPENAI_ENDPOINT    = https://your-resource.openai.azure.com/
-  AZURE_OPENAI_API_KEY     = your-api-key
-  AZURE_OPENAI_DEPLOYMENT  = gpt-4o          # your deployment name
-  AZURE_OPENAI_API_VERSION = 2024-02-15-preview
-
-Run:
-    python powerbi_chatbot.py                  # interactive chat loop
-    python powerbi_chatbot.py --once "question" # single question, then exit
-    python powerbi_chatbot.py --auth powershell # force PowerShell auth
-    python powerbi_chatbot.py --auth devicecode # force device-code auth
-    python powerbi_chatbot.py --auth env        # force env-var token
-"""
-
 import os
 import sys
 import json
@@ -60,8 +37,8 @@ EXECUTE_DAX_URL  = (
     f"/datasets/{DATASET_ID}/executeQueries"
 )
 
-MAX_ROWS_RETURNED = 200   # hard cap sent to Power BI
-MAX_ROWS_TO_LLM   = 100   # rows forwarded to Gemini for summarisation
+MAX_ROWS_RETURNED = 2000   # hard cap sent to Power BI
+MAX_ROWS_TO_LLM   = 1000   # rows forwarded to Gemini for summarisation
 
 
 # ──────────────────────────────────────────
@@ -619,22 +596,63 @@ not the measure directly:
             [Net Sales] > 0
         )
 
-**Matching entity names from get_column_values**
-When you call get_column_values and receive a list of candidate matches, you must
-select the MINIMUM number of values needed to answer the question:
-- If the user mentions ONE entity (e.g. "Home Depot"), pick EXACTLY ONE value —
-  the closest match. Do not include variants, subsidiaries, or similar names unless
-  the user explicitly asks to include them (e.g. "all Home Depot entities").
-- If the user mentions TWO entities for a comparison, pick exactly one value per entity.
-- Only use IN {{...}} with multiple values if the user explicitly asks for a group,
-  e.g. "all Walmart stores" or "any Home Depot location".
-- When in doubt, prefer the shorter/simpler name — "HOME DEPOT" over "HOME DEPOT (HD.COM)".
+## CRITICAL: where filters go in SUMMARIZECOLUMNS
 
-When the question asks for a single-row comparison (e.g. "X vs Y", "Q1 2024 vs Q1 2026"),
-do NOT use SUMMARIZECOLUMNS with no groupBy columns — it does not support CALCULATE
-filters as column arguments and will return nulls.
+A filter that constrains a column you are ALSO grouping by must be passed as a
+top-level FILTER argument of SUMMARIZECOLUMNS — NEVER buried inside a CALCULATE
+that wraps the measure.
 
-Use ROW() instead, which evaluates each measure in its own CALCULATE context:
+If you put the filter inside CALCULATE instead of at the SUMMARIZECOLUMNS level,
+the group-by column is left unconstrained in the query's own filter context, so
+SUMMARIZECOLUMNS enumerates EVERY value of that column that exists in the
+dimension (including stale/unused years like 1900, 1901, …), and the measure
+returns the same identical total on every single row. This is a very common and
+very wrong result.
+
+WRONG — produces one row per year that exists in the calendar, all with the same total:
+
+    EVALUATE
+        SUMMARIZECOLUMNS(
+            'W_CALENDAR_D'[Year],
+            "Net Sales", CALCULATE([Net Sales], 'W_CALENDAR_D'[Year] = 2025)
+        )
+
+RIGHT — year filter is a top-level FILTER argument, so only 2025 is grouped:
+
+    EVALUATE
+        SUMMARIZECOLUMNS(
+            'W_CALENDAR_D'[Year],
+            FILTER('W_CALENDAR_D', 'W_CALENDAR_D'[Year] = 2025),
+            "Net Sales", [Net Sales]
+        )
+
+## CRITICAL: single-scalar questions → use ROW(), not SUMMARIZECOLUMNS
+
+If the question asks for ONE aggregate number with NO breakdown requested
+(e.g. "how much X was sold in 2025?", "total revenue last quarter",
+"X vs Y" comparisons), do NOT group by any column. Grouping by a column you
+then filter to a single value is what produces the phantom-rows bug above.
+
+Instead use ROW(), which evaluates each measure in its own CALCULATE context.
+Time filters (year, quarter, month) and entity/class filters go INSIDE the
+CALCULATE here — that is correct, because ROW() has no group-by column to leave
+unconstrained:
+
+    EVALUATE
+        ROW(
+            "Net Sales 2025", CALCULATE(
+                [Net Sales],
+                'W_CALENDAR_D'[Year] = 2025,
+                FILTER('W_ICLASS_MBB0REP_D',
+                       'W_ICLASS_MBB0REP_D'[ItemClassDesc] IN {
+                           "Imported Rugs          07",
+                           "Imported Rugs          10",
+                           "Imported Rugs          31"
+                       })
+            )
+        )
+
+Multi-value single-row comparison ("Q1 2024 vs Q1 2026"):
 
     EVALUATE
         ROW(
@@ -650,11 +668,55 @@ Use ROW() instead, which evaluates each measure in its own CALCULATE context:
             )
         )
 
-Use ROW() any time the result is a fixed set of named scalar values.
-Use SUMMARIZECOLUMNS only when you are grouping by one or more dimension columns.
-Always limit results to {max_rows} rows using TOPN or a filter. For TOPN the
-sort column must be one of the named columns in the result table, not a measure
-reference from outside the table expression.
+Decision rule:
+  - Result is a fixed set of named scalar values, no breakdown → ROW()
+  - Result groups by one or more dimension columns → SUMMARIZECOLUMNS,
+    with any filter on a grouped column passed as a top-level FILTER argument
+
+## Matching values from get_column_values
+
+When you call get_column_values you receive a list of candidate stored values.
+How MANY you select depends on whether the user named a SPECIFIC ENTITY or a
+CATEGORY / CLASS. These are different and must be handled differently:
+
+- **Specific named entity** — a single customer, sales rep, store, or person
+  (e.g. "Home Depot", "John Smith", "Walmart"):
+  Select EXACTLY ONE value — the closest match. Do NOT include variants,
+  subsidiaries, or similarly-named entries unless the user explicitly asks for
+  all of them (e.g. "all Home Depot locations"). When choosing between
+  near-duplicates, prefer the shorter/simpler name —
+  "HOME DEPOT" over "HOME DEPOT (HD.COM)".
+
+- **Category, class, or grouping dimension** — an item class, product category,
+  region, segment, etc. (e.g. "imported rugs", "outdoor furniture", "rugs"):
+  The user is naming a GROUP that may legitimately span MULTIPLE stored values.
+  Examine ALL returned candidates and select EVERY value that genuinely belongs
+  to that group. Exclude values that merely share a word but are a different
+  class. Then filter using IN {...} listing all matching values.
+
+  Example — user asks for "imported rugs", get_column_values returns:
+      'CHENDI RUGS            10', 'Flemish Imported Rugs  31',
+      'Imported Rugs          07', 'Imported Rugs          10',
+      'Imported Rugs          31', 'Outdoor Rugs           10',
+      'Printed Rugs           31', 'Specialty Rugs         07', ...
+  Correct selection: the three "Imported Rugs" classes (07, 10, 31). Use
+  judgment on borderline cases like "Flemish Imported Rugs" — include it only if
+  it plausibly fits the user's intent. EXCLUDE unrelated classes that merely
+  contain the word "Rugs" (Outdoor, Printed, Chendi, Specialty).
+
+  Resulting filter:
+      FILTER('W_ICLASS_MBB0REP_D',
+             'W_ICLASS_MBB0REP_D'[ItemClassDesc] IN {
+                 "Imported Rugs          07",
+                 "Imported Rugs          10",
+                 "Imported Rugs          31"
+             })
+
+- **Copy returned values VERBATIM** — including any trailing spaces, padding, or
+  numeric codes (e.g. "Imported Rugs          31"). IN {...} and = perform
+  EXACT string matching. Do not trim, re-pad, drop the trailing code, or
+  reformat the value in any way. Use the strings exactly as get_column_values
+  returned them.
 
 **Year-over-year**
 If a YoY comparison is requested with no explicit time period, compare
@@ -666,6 +728,9 @@ Prefer SUMMARIZECOLUMNS over SUMMARIZE for queries that include measures — it
 handles blank rows and cross-filter context more predictably. Only fall back to
 ADDCOLUMNS(SUMMARIZE(...)) if you need to add computed columns to an existing
 row set.
+
+**Currency**
+When the question implies a currency, get that CurrencyID from W_SHPEXT_F.
 """.strip()
 
 
@@ -736,7 +801,7 @@ def _prune_schema(schema: Dict[str, Any], question: str) -> Dict[str, Any]:
 
 def build_dax_instruction(schema: Dict[str, Any], question: str,
                           prior_dax: str = "", error_msg: str = "") -> str:
-    prompt = DAX_SYSTEM_PROMPT.format(max_rows=MAX_ROWS_RETURNED)
+    prompt = DAX_SYSTEM_PROMPT
     # Prune schema to only relevant tables before serialising
     lean_schema = _prune_schema(schema, question)
     parts = [

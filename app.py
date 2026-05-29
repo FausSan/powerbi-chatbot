@@ -1,13 +1,3 @@
-"""
-app.py — Streamlit frontend for the Power BI Chatbot
-=====================================================
-Run:
-    streamlit run app.py
-    streamlit run app.py -- --auth devicecode   # force auth method
-
-Requires powerbi_chatbot.py to be in the same directory.
-"""
-
 import sys
 import os
 import json
@@ -17,28 +7,19 @@ import threading
 import streamlit as st
 import pandas as pd
 
-# ── Import backend ──────────────────────────────────────────────────────────
-# We import the chatbot module but override ask() to also return the
-# intermediate DAX and dataframe for display in the UI.
 from powerbi_chatbot import (
     acquire_token,
-    ask,
     execute_dax,
     result_to_dataframe,
-    run_function_calling_turn,
     generate_response,
     build_dax_instruction,
     build_answer_instruction,
     parse_json_strict,
     _extract_pbi_error,
-    _call_openai,
-    fetch_column_values,
     begin_question,
     flush_tokens,
     DAX_MAX_RETRIES,
     SCHEMA_PATH,
-    TOKEN_LOG_PATH,
-    OPENAI_TOOLS,
 )
 
 # ── Page config ─────────────────────────────────────────────────────────────

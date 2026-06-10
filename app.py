@@ -5,6 +5,7 @@ import time
 import argparse
 import threading
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 
 from powerbi_chatbot import (
@@ -22,6 +23,18 @@ from powerbi_chatbot import (
     SCHEMA_PATH,
 )
 
+# ── Power BI report embed ─────────────────────────────────────────────────────
+# Reporte "Natco Executive Sales Dashboard". Se puede sobreescribir con la variable
+# de entorno POWERBI_EMBED_URL. Si queda vacía, se muestra un placeholder.
+POWERBI_EMBED_URL = os.environ.get(
+    "POWERBI_EMBED_URL",
+    "https://app.powerbi.com/reportEmbed"
+    "?reportId=03f15a97-af85-4a62-b681-bcf79c975c3f"
+    "&autoAuth=true"
+    "&ctid=fe373213-5789-445c-ad21-62e1d031e688",
+)
+POWERBI_REPORT_TITLE = os.environ.get("POWERBI_REPORT_TITLE", "Natco Executive Sales Dashboard")
+
 # ── Page config ─────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="PBI Analyst",
@@ -33,317 +46,219 @@ st.set_page_config(
 # ── Custom CSS ───────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
 
-/* ── Base ── */
+/* ── Design tokens ──
+   ink     #101418   app background (warm charcoal)
+   panel   #181d24   raised surfaces
+   line     #2a323c   borders
+   text    #e8ecf1   primary text
+   muted   #9aa6b4   secondary text (legible on dark)
+   faint   #6b7785   tertiary / labels
+   gold    #f5c518   primary accent (Power BI)
+   teal    #54c6c0   secondary accent (data / assistant)
+*/
+
 html, body, [class*="css"] {
-    font-family: 'IBM Plex Sans', sans-serif;
-    background-color: #0a0e14;
-    color: #c9d1d9;
+    font-family: 'Inter', sans-serif;
+    background-color: #101418;
+    color: #e8ecf1;
 }
+.stApp { background-color: #101418; }
 
-.stApp {
-    background-color: #0a0e14;
-}
-
-/* ── Hide streamlit chrome ── */
 #MainMenu, footer, header { visibility: hidden; }
 .stDeployButton { display: none; }
 [data-testid="stToolbar"] { display: none; }
+
+.block-container { padding-top: 1.4rem; max-width: 1500px; }
 
 /* ── Header ── */
 .pbi-header {
     display: flex;
     align-items: center;
     gap: 14px;
-    padding: 28px 0 20px 0;
-    border-bottom: 1px solid #1e2940;
-    margin-bottom: 32px;
+    padding: 6px 0 18px 0;
+    border-bottom: 1px solid #2a323c;
+    margin-bottom: 22px;
 }
 .pbi-logo {
-    width: 38px;
-    height: 38px;
-    background: linear-gradient(135deg, #f2c811 0%, #e8a000 100%);
-    border-radius: 8px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 20px;
-    flex-shrink: 0;
+    width: 40px; height: 40px;
+    background: linear-gradient(135deg, #f5c518 0%, #e0a800 100%);
+    border-radius: 10px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 21px; flex-shrink: 0;
+    box-shadow: 0 4px 14px #f5c51825;
 }
 .pbi-title {
-    font-size: 22px;
-    font-weight: 600;
-    color: #e6edf3;
-    letter-spacing: -0.3px;
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: 23px; font-weight: 600;
+    color: #f3f6fa; letter-spacing: -0.4px;
 }
 .pbi-subtitle {
-    font-size: 12px;
-    color: #6e7681;
-    font-family: 'IBM Plex Mono', monospace;
-    letter-spacing: 0.5px;
-    text-transform: uppercase;
-    margin-top: 2px;
+    font-size: 11px; color: #7d8896;
+    font-family: 'JetBrains Mono', monospace;
+    letter-spacing: 1px; text-transform: uppercase; margin-top: 3px;
 }
 .status-dot {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    margin-left: auto;
-    flex-shrink: 0;
+    width: 9px; height: 9px; border-radius: 50%;
+    margin-left: 6px; flex-shrink: 0;
 }
-.status-dot.connected { background: #3fb950; box-shadow: 0 0 8px #3fb95066; }
+.status-dot.connected { background: #3fb950; box-shadow: 0 0 10px #3fb95077; }
 .status-dot.disconnected { background: #f85149; }
-.status-dot.connecting {
-    background: #f2c811;
-    animation: pulse 1.5s ease-in-out infinite;
+.status-dot.connecting { background: #f5c518; animation: pulse 1.5s ease-in-out infinite; }
+@keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:.3;} }
+
+/* ── Pane titles ── */
+.pane-label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px; letter-spacing: 1.5px; text-transform: uppercase;
+    color: #9aa6b4; margin: 0 0 12px 2px;
+    display: flex; align-items: center; gap: 8px;
 }
-@keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.3; }
+.pane-label::before {
+    content: ""; width: 14px; height: 2px;
+    background: #f5c518; border-radius: 2px;
+}
+
+/* ── Report frame ── */
+.report-frame {
+    border: 1px solid #2a323c; border-radius: 14px;
+    overflow: hidden; background: #181d24;
+}
+.report-placeholder {
+    border: 1px dashed #2a323c; border-radius: 14px;
+    background: #161b21; height: 700px;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    text-align: center; padding: 40px;
 }
 
 /* ── Chat messages ── */
 .msg-wrapper {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    margin-bottom: 24px;
-    animation: fadeIn 0.3s ease;
+    display: flex; flex-direction: column; gap: 5px;
+    margin-bottom: 20px; animation: fadeIn 0.3s ease;
 }
-@keyframes fadeIn {
-    from { opacity: 0; transform: translateY(6px); }
-    to   { opacity: 1; transform: translateY(0); }
-}
+@keyframes fadeIn { from{opacity:0;transform:translateY(6px);} to{opacity:1;transform:translateY(0);} }
 .msg-role {
-    font-size: 10px;
-    font-family: 'IBM Plex Mono', monospace;
-    letter-spacing: 1px;
-    text-transform: uppercase;
-    color: #6e7681;
-    padding-left: 2px;
+    font-size: 10px; font-family: 'JetBrains Mono', monospace;
+    letter-spacing: 1px; text-transform: uppercase; color: #7d8896; padding-left: 2px;
 }
 .msg-bubble {
-    padding: 14px 18px;
-    border-radius: 10px;
-    font-size: 14.5px;
-    line-height: 1.65;
-    max-width: 85%;
+    padding: 13px 17px; border-radius: 13px;
+    font-size: 14.5px; line-height: 1.65; max-width: 88%;
 }
 .msg-bubble.user {
-    background: #161b27;
-    border: 1px solid #1e2940;
-    color: #c9d1d9;
-    align-self: flex-end;
-    border-bottom-right-radius: 3px;
+    background: #f5c518; color: #1a1407; font-weight: 500;
+    align-self: flex-end; border-bottom-right-radius: 4px;
 }
 .msg-bubble.assistant {
-    background: #0d1117;
-    border: 1px solid #1e2940;
-    color: #c9d1d9;
-    align-self: flex-start;
-    border-bottom-left-radius: 3px;
+    background: #1b212a; border: 1px solid #2a323c; color: #e1e7ee;
+    align-self: flex-start; border-bottom-left-radius: 4px;
 }
 .msg-bubble.error {
-    background: #1a0a0a;
-    border: 1px solid #f8514933;
-    color: #f85149;
+    background: #21141420; border: 1px solid #f8514944; color: #ff7b72;
+    align-self: flex-start;
 }
 
-/* ── DAX expander ── */
+/* ── DAX block ── */
 .dax-block {
-    background: #060a10;
-    border: 1px solid #1e2940;
-    border-radius: 8px;
-    padding: 14px 16px;
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 12.5px;
-    color: #79c0ff;
-    line-height: 1.7;
-    overflow-x: auto;
-    white-space: pre;
-    margin-top: 10px;
+    background: #0c1015; border: 1px solid #2a323c; border-radius: 10px;
+    padding: 14px 16px; font-family: 'JetBrains Mono', monospace;
+    font-size: 12.5px; color: #7ee0d6; line-height: 1.7;
+    overflow-x: auto; white-space: pre; margin-top: 10px;
 }
-.dax-label {
-    font-size: 10px;
-    font-family: 'IBM Plex Mono', monospace;
-    letter-spacing: 1px;
-    text-transform: uppercase;
-    color: #6e7681;
-    margin-bottom: 6px;
+.dax-label, .data-label {
+    font-size: 10px; font-family: 'JetBrains Mono', monospace;
+    letter-spacing: 1px; text-transform: uppercase; color: #9aa6b4; margin-bottom: 6px;
 }
 
 /* ── Tool call badge ── */
 .tool-badge {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    background: #0d1b2a;
-    border: 1px solid #1e3a5f;
-    border-radius: 20px;
-    padding: 4px 12px;
-    font-size: 11px;
-    font-family: 'IBM Plex Mono', monospace;
-    color: #58a6ff;
-    margin: 4px 4px 4px 0;
+    display: inline-flex; align-items: center; gap: 6px;
+    background: #15242b; border: 1px solid #265058; border-radius: 20px;
+    padding: 4px 12px; font-size: 11px;
+    font-family: 'JetBrains Mono', monospace; color: #54c6c0; margin: 4px 4px 4px 0;
 }
 
-/* ── Data table ── */
-.data-section {
-    margin-top: 14px;
-}
-.data-label {
-    font-size: 10px;
-    font-family: 'IBM Plex Mono', monospace;
-    letter-spacing: 1px;
-    text-transform: uppercase;
-    color: #6e7681;
-    margin-bottom: 8px;
-}
+/* ── Notes ── */
+.notes-text { font-size: 12.5px; color: #9aa6b4; font-style: italic; margin-top: 8px; padding-left: 2px; }
 
-/* ── Streamlit dataframe overrides ── */
+/* ── Dataframe ── */
 [data-testid="stDataFrame"] {
-    border: 1px solid #1e2940 !important;
-    border-radius: 8px !important;
-    overflow: hidden;
+    border: 1px solid #2a323c !important; border-radius: 10px !important; overflow: hidden;
 }
 
-/* ── Input area ── */
-.input-area {
-    position: sticky;
-    bottom: 0;
-    background: linear-gradient(transparent, #0a0e14 30%);
-    padding: 20px 0 16px 0;
-    margin-top: 12px;
-}
-
-/* ── Streamlit input overrides ── */
+/* ── Text input ── */
 .stTextInput > div > div > input {
-    background: #0d1117 !important;
-    border: 1px solid #30363d !important;
-    border-radius: 10px !important;
-    color: #e6edf3 !important;
-    font-family: 'IBM Plex Sans', sans-serif !important;
-    font-size: 14px !important;
-    padding: 12px 16px !important;
-    caret-color: #f2c811;
+    background: #161b21 !important; border: 1px solid #2a323c !important;
+    border-radius: 11px !important; color: #f3f6fa !important;
+    font-family: 'Inter', sans-serif !important; font-size: 14px !important;
+    padding: 13px 16px !important; caret-color: #f5c518;
 }
 .stTextInput > div > div > input:focus {
-    border-color: #f2c811 !important;
-    box-shadow: 0 0 0 3px #f2c81118 !important;
+    border-color: #f5c518 !important; box-shadow: 0 0 0 3px #f5c5181c !important;
 }
-.stTextInput > div > div > input::placeholder {
-    color: #484f58 !important;
-}
+.stTextInput > div > div > input::placeholder { color: #6b7785 !important; }
 
-/* ── Button ── */
-.stButton > button {
-    background: #f2c811 !important;
-    color: #0a0e14 !important;
-    border: none !important;
-    border-radius: 8px !important;
-    font-family: 'IBM Plex Sans', sans-serif !important;
-    font-weight: 600 !important;
-    font-size: 13px !important;
-    padding: 10px 22px !important;
-    letter-spacing: 0.3px;
-    transition: all 0.15s ease !important;
-    height: 46px !important;
+/* ── Buttons (regular + form submit) ── */
+.stButton > button, .stFormSubmitButton > button {
+    background: #f5c518 !important; color: #1a1407 !important; border: none !important;
+    border-radius: 10px !important; font-family: 'Space Grotesk', sans-serif !important;
+    font-weight: 600 !important; font-size: 13.5px !important;
+    padding: 11px 18px !important; letter-spacing: 0.2px;
+    transition: all 0.15s ease !important; height: 48px !important;
+    white-space: nowrap !important; min-width: 0 !important;
 }
-.stButton > button:hover {
-    background: #ffd433 !important;
-    transform: translateY(-1px);
-    box-shadow: 0 4px 12px #f2c81130 !important;
+.stButton > button:hover, .stFormSubmitButton > button:hover {
+    background: #ffd83a !important; transform: translateY(-1px);
+    box-shadow: 0 5px 16px #f5c51838 !important;
 }
-.stButton > button:active {
-    transform: translateY(0) !important;
+.stButton > button:active, .stFormSubmitButton > button:active { transform: translateY(0) !important; }
+
+/* form has no border/padding box */
+[data-testid="stForm"] { border: none !important; padding: 0 !important; }
+
+/* ── Spinner — light text so "Thinking…" is readable ── */
+[data-testid="stSpinner"] { color: #e8ecf1 !important; }
+[data-testid="stSpinner"] p { color: #e8ecf1 !important; font-family: 'Inter', sans-serif !important; }
+.stSpinner > div { border-top-color: #f5c518 !important; }
+
+/* ── Expander ── */
+[data-testid="stExpander"] {
+    background: #161b21 !important; border: 1px solid #2a323c !important; border-radius: 10px !important;
+}
+[data-testid="stExpander"] summary {
+    color: #9aa6b4 !important; font-size: 12px !important;
+    font-family: 'JetBrains Mono', monospace !important;
 }
 
 /* ── Auth screen ── */
 .auth-card {
-    max-width: 440px;
-    margin: 80px auto;
-    background: #0d1117;
-    border: 1px solid #1e2940;
-    border-radius: 16px;
-    padding: 40px;
-    text-align: center;
+    max-width: 460px; margin: 70px auto; background: #181d24;
+    border: 1px solid #2a323c; border-radius: 18px; padding: 44px; text-align: center;
 }
-.auth-icon {
-    font-size: 48px;
-    margin-bottom: 20px;
-}
+.auth-icon { font-size: 48px; margin-bottom: 20px; }
 .auth-title {
-    font-size: 22px;
-    font-weight: 600;
-    color: #e6edf3;
-    margin-bottom: 8px;
+    font-family: 'Space Grotesk', sans-serif; font-size: 23px; font-weight: 600;
+    color: #f3f6fa; margin-bottom: 10px;
 }
-.auth-desc {
-    font-size: 13.5px;
-    color: #6e7681;
-    line-height: 1.6;
-    margin-bottom: 28px;
-}
-
-/* ── Spinner override ── */
-.stSpinner > div {
-    border-top-color: #f2c811 !important;
-}
-
-/* ── Expander ── */
-[data-testid="stExpander"] {
-    background: #0d1117 !important;
-    border: 1px solid #1e2940 !important;
-    border-radius: 8px !important;
-}
-[data-testid="stExpander"] summary {
-    color: #6e7681 !important;
-    font-size: 12px !important;
-    font-family: 'IBM Plex Mono', monospace !important;
-}
+.auth-desc { font-size: 13.5px; color: #9aa6b4; line-height: 1.6; margin-bottom: 4px; }
 
 /* ── Token counter ── */
-.token-counter {
-    display: flex;
-    gap: 16px;
-    margin-left: auto;
-    align-items: center;
-}
-.token-stat {
-    text-align: right;
-}
+.token-counter { display: flex; gap: 18px; margin-left: auto; align-items: center; }
+.token-stat { text-align: right; }
 .token-stat-value {
-    font-size: 13px;
-    font-family: 'IBM Plex Mono', monospace;
-    color: #f2c811;
-    font-weight: 500;
+    font-size: 14px; font-family: 'JetBrains Mono', monospace; color: #f5c518; font-weight: 500;
 }
 .token-stat-label {
-    font-size: 9px;
-    font-family: 'IBM Plex Mono', monospace;
-    letter-spacing: 0.8px;
-    text-transform: uppercase;
-    color: #484f58;
+    font-size: 9px; font-family: 'JetBrains Mono', monospace;
+    letter-spacing: 0.8px; text-transform: uppercase; color: #7d8896;
 }
-.token-divider {
-    width: 1px;
-    height: 28px;
-    background: #1e2940;
-}
-::-webkit-scrollbar { width: 6px; height: 6px; }
-::-webkit-scrollbar-track { background: #0a0e14; }
-::-webkit-scrollbar-thumb { background: #21262d; border-radius: 3px; }
-::-webkit-scrollbar-thumb:hover { background: #30363d; }
+.token-divider { width: 1px; height: 30px; background: #2a323c; }
 
-/* ── Notes text ── */
-.notes-text {
-    font-size: 12.5px;
-    color: #8b949e;
-    font-style: italic;
-    margin-top: 8px;
-    padding-left: 2px;
-}
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #2a323c; border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: #3a4451; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -540,10 +455,10 @@ def render_message(msg: dict):
                 t = meta["tokens"]
                 total = t["input"] + t["output"]
                 st.markdown(
-                    f'<div class="notes-text" style="color:#484f58;">🔢 Tokens — '
-                    f'in: <span style="color:#f2c811">{t["input"]:,}</span> · '
-                    f'out: <span style="color:#f2c811">{t["output"]:,}</span> · '
-                    f'total: <span style="color:#f2c811">{total:,}</span></div>',
+                    f'<div class="notes-text" style="color:#7d8896;">🔢 Tokens — '
+                    f'in: <span style="color:#f5c518">{t["input"]:,}</span> · '
+                    f'out: <span style="color:#f5c518">{t["output"]:,}</span> · '
+                    f'total: <span style="color:#f5c518">{total:,}</span></div>',
                     unsafe_allow_html=True,
                 )
             st.markdown('<div class="dax-label">Generated DAX</div>',
@@ -643,37 +558,32 @@ def render_auth_screen():
     # ── Waiting for user to complete sign-in ──────────────────────────────────
     if flow and flow_result == "pending":
         st.markdown(f"""
-        <div style="max-width:460px;margin:0 auto;background:#0d1117;
-                    border:1px solid #1e2940;border-radius:12px;
+        <div style="max-width:460px;margin:0 auto;background:#181d24;
+                    border:1px solid #2a323c;border-radius:14px;
                     padding:32px;text-align:center;">
-            <div style="font-size:13px;color:#8b949e;margin-bottom:20px;line-height:1.6;">
+            <div style="font-size:13px;color:#9aa6b4;margin-bottom:20px;line-height:1.6;">
                 Open
                 <a href="https://microsoft.com/devicelogin" target="_blank"
-                   style="color:#f2c811;text-decoration:none;font-weight:600;">
+                   style="color:#f5c518;text-decoration:none;font-weight:600;">
                    microsoft.com/devicelogin</a>
                 and enter this code:
             </div>
-            <div style="font-family:'IBM Plex Mono',monospace;font-size:36px;
-                        font-weight:600;color:#e6edf3;letter-spacing:8px;
-                        background:#060a10;padding:18px 28px;border-radius:8px;
-                        border:1px solid #30363d;display:inline-block;
+            <div style="font-family:'JetBrains Mono',monospace;font-size:36px;
+                        font-weight:600;color:#f3f6fa;letter-spacing:8px;
+                        background:#0c1015;padding:18px 28px;border-radius:10px;
+                        border:1px solid #2a323c;display:inline-block;
                         margin-bottom:24px;">
                 {flow["user_code"]}
             </div>
-            <div style="font-size:12px;color:#484f58;">
+            <div style="font-size:12px;color:#7d8896;">
                 Waiting for sign-in… refreshing automatically.
             </div>
         </div>
         """, unsafe_allow_html=True)
 
-        # Poll directly in the main thread with a short timeout
-        # acquire_token_by_device_flow blocks until done or expired,
-        # so we use the non-blocking check via initiate_device_flow's expires_in
         app = st.session_state.get("device_flow_app")
         if app:
             try:
-                # Try to acquire with a 4-second window — if not ready yet,
-                # MSAL raises or returns an error dict we can check
                 result = app.acquire_token_by_device_flow(
                     {**flow, "expires_in": 4}  # short poll window
                 )
@@ -693,8 +603,6 @@ def render_auth_screen():
         return
 
     # ── Initial button ────────────────────────────────────────────────────────
-    # Local Windows: PowerShell browser popup (fast, seamless)
-    # Streamlit Cloud / Linux: device-code shown on screen
     col1, col2, col3 = st.columns([1, 1.2, 1])
     with col2:
         if st.button("Sign in with Microsoft", use_container_width=True):
@@ -719,12 +627,122 @@ def render_auth_screen():
         st.error(f"Authentication failed: {st.session_state.auth_error}")
 
 
+# ── Power BI report pane ──────────────────────────────────────────────────────
+def render_report_pane():
+    st.markdown('<div class="pane-label">Power BI report</div>', unsafe_allow_html=True)
+    if POWERBI_EMBED_URL:
+        st.markdown('<div class="report-frame">', unsafe_allow_html=True)
+        components.html(
+            f"""
+            <iframe
+                title="{POWERBI_REPORT_TITLE}"
+                width="100%"
+                height="100%"
+                style="border:none; display:block; height:700px;"
+                src="{POWERBI_EMBED_URL}"
+                frameborder="0"
+                allowFullScreen="true">
+            </iframe>
+            """,
+            height=700,
+            scrolling=False,
+        )
+        st.markdown('</div>', unsafe_allow_html=True)
+    else:
+        st.markdown("""
+        <div class="report-placeholder">
+            <div style="font-size:40px;margin-bottom:14px;">📊</div>
+            <div style="font-size:15px;color:#c4ccd6;margin-bottom:8px;">
+                No report URL configured
+            </div>
+            <div style="font-size:12.5px;color:#9aa6b4;line-height:1.7;max-width:340px;">
+                Set <code style="color:#f5c518;">POWERBI_EMBED_URL</code> (env var) or edit the
+                constant at the top of <code style="color:#f5c518;">app.py</code> with your
+                report's embed link.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+
+# ── Conversation pane ─────────────────────────────────────────────────────────
+def render_chat_pane(schema, token):
+    st.markdown('<div class="pane-label">Conversation</div>', unsafe_allow_html=True)
+
+    # Scrollable history
+    history_box = st.container(height=560)
+    with history_box:
+        if not st.session_state.messages:
+            st.markdown("""
+            <div style="text-align:center; padding: 90px 0; color:#6b7785;">
+                <div style="font-size:34px;margin-bottom:14px;">💬</div>
+                <div style="font-size:14.5px;color:#9aa6b4;">
+                    Ask anything about your Power BI data
+                </div>
+                <div style="font-size:12px;color:#6b7785;margin-top:8px;
+                            font-family:'JetBrains Mono',monospace;">
+                    "Top 10 customers by net sales" · "Compare Walmart Q1 2024 vs 2026"
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+        for msg in st.session_state.messages:
+            render_message(msg)
+
+    # Input row — wrapped in a form so Enter submits
+    with st.form(key="ask_form", clear_on_submit=True):
+        col_input, col_btn = st.columns([5, 1.4])
+        with col_input:
+            question = st.text_input(
+                label="question",
+                label_visibility="collapsed",
+                placeholder="Ask a question…",
+                key="question_input",
+            )
+        with col_btn:
+            send = st.form_submit_button("Send", use_container_width=True)
+
+    if send and question.strip():
+        st.session_state.pending_question = question.strip()
+        st.rerun()
+
+    # Process the pending question on the rerun after submit
+    if st.session_state.pending_question:
+        q = st.session_state.pending_question
+        st.session_state.pending_question = None
+
+        st.session_state.messages.append({"role": "user", "content": q})
+
+        with st.spinner("Thinking…"):
+            result = ask_with_meta(q, schema, token)
+
+        if result["error"]:
+            content = f"❌ {result['error']}"
+            meta    = {"error": True}
+        else:
+            content = result["answer"]
+            meta    = {
+                "dax":        result["dax"],
+                "notes":      result["notes"],
+                "df":         result["df"],
+                "tool_calls": result["tool_calls"],
+                "tokens":     result["tokens"],
+            }
+            st.session_state.session_tokens["input"]  += result["tokens"]["input"]
+            st.session_state.session_tokens["output"] += result["tokens"]["output"]
+
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": content,
+            "meta": meta,
+        })
+        st.rerun()
+
+
 # ── Main chat UI ──────────────────────────────────────────────────────────────
 def render_chat():
     schema = st.session_state.schema
     token  = st.session_state.token
 
-    # Header
+    # Header (full width)
     sess_in  = st.session_state.session_tokens["input"]
     sess_out = st.session_state.session_tokens["output"]
     st.markdown(f"""
@@ -732,7 +750,7 @@ def render_chat():
         <div class="pbi-logo">📊</div>
         <div>
             <div class="pbi-title">PBI Analyst</div>
-            <div class="pbi-subtitle">GPT · Power BI · Natural Language</div>
+            <div class="pbi-subtitle">NATCO</div>
         </div>
         <div class="token-counter">
             <div class="token-stat">
@@ -754,81 +772,12 @@ def render_chat():
     </div>
     """, unsafe_allow_html=True)
 
-    # Chat history
-    for msg in st.session_state.messages:
-        render_message(msg)
-
-    # Empty state
-    if not st.session_state.messages:
-        st.markdown("""
-        <div style="text-align:center; padding: 60px 0; color: #484f58;">
-            <div style="font-size: 36px; margin-bottom: 16px;">💬</div>
-            <div style="font-size: 15px; color: #6e7681;">
-                Ask anything about your Power BI data
-            </div>
-            <div style="font-size: 12px; color: #484f58; margin-top: 8px; font-family: 'IBM Plex Mono', monospace;">
-                e.g. "Top 10 customers by net sales" · "Compare Walmart Q1 2024 vs 2026"
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    # Input row
-    st.markdown('<div class="input-area">', unsafe_allow_html=True)
-    col_input, col_btn = st.columns([6, 1])
-
-    with col_input:
-        question = st.text_input(
-            label="question",
-            label_visibility="collapsed",
-            placeholder="Ask a question about your data…",
-            key="question_input",
-        )
-    with col_btn:
-        send = st.button("Send", use_container_width=True)
-
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    # On Send: store the question and clear the input, then rerun once to show
-    # the user bubble and trigger processing on the next pass.
-    if send and question.strip():
-        st.session_state.pending_question = question.strip()
-        st.rerun()
-
-    # Process the pending question (runs on the rerun after Send was clicked)
-    if st.session_state.pending_question:
-        q = st.session_state.pending_question
-        st.session_state.pending_question = None  # clear immediately to prevent re-runs
-
-        # Add user message to history
-        st.session_state.messages.append({"role": "user", "content": q})
-
-        # Run pipeline
-        with st.spinner("Thinking…"):
-            result = ask_with_meta(q, schema, token)
-
-        # Build assistant message
-        if result["error"]:
-            content = f"❌ {result['error']}"
-            meta    = {"error": True}
-        else:
-            content = result["answer"]
-            meta    = {
-                "dax":        result["dax"],
-                "notes":      result["notes"],
-                "df":         result["df"],
-                "tool_calls": result["tool_calls"],
-                "tokens":     result["tokens"],
-            }
-            # Accumulate into session totals
-            st.session_state.session_tokens["input"]  += result["tokens"]["input"]
-            st.session_state.session_tokens["output"] += result["tokens"]["output"]
-
-        st.session_state.messages.append({
-            "role": "assistant",
-            "content": content,
-            "meta": meta,
-        })
-        st.rerun()
+    # Two panes side by side: report on the left, chat on the right
+    left, right = st.columns([1.35, 1], gap="large")
+    with left:
+        render_report_pane()
+    with right:
+        render_chat_pane(schema, token)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

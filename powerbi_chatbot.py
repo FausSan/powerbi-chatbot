@@ -679,8 +679,9 @@ When you call get_column_values you receive a list of candidate stored values.
 How MANY you select depends on whether the user named a SPECIFIC ENTITY or a
 CATEGORY / CLASS. These are different and must be handled differently:
 
+REALLY IMPORTANT AND MANDATORY RULES:
 - **Specific named entity** — a single customer, sales rep, store, or person
-  (e.g. "Home Depot", "John Smith", "Walmart"):
+  (e.g. "Home Depot", "John Smith", "Walmart", "Costco"):
   Select EXACTLY ONE value — the closest match. Do NOT include variants,
   subsidiaries, or similarly-named entries unless the user explicitly asks for
   all of them (e.g. "all Home Depot locations"). When choosing between

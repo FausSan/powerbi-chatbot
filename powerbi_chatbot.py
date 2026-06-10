@@ -731,6 +731,14 @@ row set.
 
 **Currency**
 When the question implies a currency, get that CurrencyID from W_SHPEXT_F.
+
+**Gross sales**
+When you are asked about gross sales, OrderType_Categorical (from W_SHPEXT_F) should be equal to Customer Orders. 
+W_SHPEXT_F[OrderType_Categorical]=\"CO-Customer Orders\". Read "name": "Gross Sales".
+
+Credit Memos are "negative sales". Adjustments, returns, cancellations, etc.
+
+
 """.strip()
 
 

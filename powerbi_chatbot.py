@@ -204,10 +204,6 @@ def result_to_dataframe(result_json: Dict[str, Any]) -> pd.DataFrame:
 
 
 # ──────────────────────────────────────────
-# Gemini (Vertex AI) + Function Calling
-# ──────────────────────────────────────────
-
-# ──────────────────────────────────────────
 # Azure OpenAI + Function Calling
 # ──────────────────────────────────────────
 
@@ -659,12 +655,16 @@ Multi-value single-row comparison ("Q1 2024 vs Q1 2026"):
             "Q1 2024 Sales", CALCULATE(
                 [Net Sales],
                 FILTER('W_CALENDAR_D', 'W_CALENDAR_D'[Year] = 2024 && 'W_CALENDAR_D'[Quarter] = 1),
-                FILTER('W_CUST_MBBFREP_D', 'W_CUST_MBBFREP_D'[AlphaSortName] = "WAL-MART STORES")
+                FILTER('W_CUST_MBBFREP_D',
+                       'W_CUST_MBBFREP_D'[AlphaSortName] IN { "WAL-MART STORES", "WALMART.COM" }
+                       && 'W_CUST_MBBFREP_D'[flag_corporate_customer] = "Y")
             ),
             "Q1 2026 Sales", CALCULATE(
                 [Net Sales],
                 FILTER('W_CALENDAR_D', 'W_CALENDAR_D'[Year] = 2026 && 'W_CALENDAR_D'[Quarter] = 1),
-                FILTER('W_CUST_MBBFREP_D', 'W_CUST_MBBFREP_D'[AlphaSortName] = "WAL-MART STORES")
+                FILTER('W_CUST_MBBFREP_D',
+                       'W_CUST_MBBFREP_D'[AlphaSortName] IN { "WAL-MART STORES", "WALMART.COM" }
+                       && 'W_CUST_MBBFREP_D'[flag_corporate_customer] = "Y")
             )
         )
 
@@ -676,17 +676,32 @@ Decision rule:
 ## Matching values from get_column_values
 
 When you call get_column_values you receive a list of candidate stored values.
-How MANY you select depends on whether the user named a SPECIFIC ENTITY or a
-CATEGORY / CLASS. These are different and must be handled differently:
+How you use them depends on WHAT the user asked for. Read these customer rules
+carefully — they OVERRIDE any simplified single-value illustrations shown
+elsewhere in this prompt.
 
-REALLY IMPORTANT AND MANDATORY RULES:
-- **Specific named entity** — a single customer, sales rep, store, or person
-  (e.g. "Home Depot", "John Smith", "Walmart", "Costco"):
-  Select EXACTLY ONE value — the closest match. Do NOT include variants,
-  subsidiaries, or similarly-named entries unless the user explicitly asks for
-  all of them (e.g. "all Home Depot locations"). When choosing between
-  near-duplicates, prefer the shorter/simpler name —
-  "HOME DEPOT" over "HOME DEPOT (HD.COM)".
+- **Specific named customer (no region)** — the user names ONE customer
+  (e.g. "Walmart's sales", "Home Depot orders"):
+  Use ALL returned values that match that query in an IN {...} list — NOT just
+  one. e.g. for "walmart", include EVERY "WAL-MART …" / "WALMART …" variant the
+  tool returned. ALWAYS combine this with the corporate-customer filter below.
+
+- **General / non-specific customer request** — no single entity is named
+  (e.g. "top customers", "sales by customer", "customer breakdown", "our
+  customers"): do NOT collapse to one value. Group across customers
+  (SUMMARIZECOLUMNS on the name column) or include EVERY matching value. ALWAYS
+  combine with the corporate-customer filter below.
+
+- **Customer scoped to a SPECIFIC REGION** — the user restricts the question to a
+  region (e.g. "Walmart sales in the West", "customers in the Northeast"):
+  Do NOT apply the corporate-customer flag in this case. Instead take ALL the
+  matching names (no flag restriction) and select the name(s) that match BOTH the
+  customer and the region, filtering by the region column exactly as it appears
+  in the schema.
+
+- **Specific named entity that is NOT a customer** — a single sales rep, store,
+  or person (e.g. "John Smith"): select EXACTLY ONE value — the closest match.
+  Prefer the shorter/simpler name — "HOME DEPOT" over "HOME DEPOT (HD.COM)".
 
 - **Category, class, or grouping dimension** — an item class, product category,
   region, segment, etc. (e.g. "imported rugs", "outdoor furniture", "rugs"):
@@ -718,6 +733,41 @@ REALLY IMPORTANT AND MANDATORY RULES:
   EXACT string matching. Do not trim, re-pad, drop the trailing code, or
   reformat the value in any way. Use the strings exactly as get_column_values
   returned them.
+
+**Corporate-customer filter — apply on customer queries that are NOT region-scoped**
+For the "specific named customer (no region)" and "general customer request"
+cases above, restrict to corporate customers by adding
+'W_CUST_MBBFREP_D'[flag_corporate_customer] = "Y"
+as a top-level FILTER argument of SUMMARIZECOLUMNS, or inside CALCULATE for
+ROW()-style scalar queries. Do NOT add this flag when the question is scoped to a
+specific region.
+
+Example — single customer, ALL matching names + corporate flag (no region):
+
+    EVALUATE
+        ROW(
+            "Net Sales", CALCULATE(
+                [Net Sales],
+                FILTER('W_CUST_MBBFREP_D',
+                       'W_CUST_MBBFREP_D'[AlphaSortName] IN {
+                           "WAL-MART STORES", "WALMART.COM", "WALMART STORES INC"
+                       }
+                       && 'W_CUST_MBBFREP_D'[flag_corporate_customer] = "Y")
+            )
+        )
+
+Example — customer scoped to a region (NO corporate flag; replace [Region] with
+the real region column from the schema):
+
+    EVALUATE
+        ROW(
+            "Net Sales", CALCULATE(
+                [Net Sales],
+                FILTER('W_CUST_MBBFREP_D',
+                       'W_CUST_MBBFREP_D'[AlphaSortName] IN { "WAL-MART STORES", "WALMART.COM" }
+                       && 'W_CUST_MBBFREP_D'[Region] = "West")
+            )
+        )
 
 **Year-over-year**
 If a YoY comparison is requested with no explicit time period, compare

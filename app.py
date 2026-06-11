@@ -717,7 +717,7 @@ def render_persistent_dashboard():
 
     # Close button — always rendered, hidden by CSS when closed
     with st.container(key="pbi_close"):
-        if st.button("✕  Cerrar", key="close_dash", type="secondary"):
+        if st.button("✕  Close", key="close_dash", type="secondary"):
             st.session_state.dash_open = False
             st.rerun()
 

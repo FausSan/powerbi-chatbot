@@ -688,11 +688,8 @@ CATEGORY / CLASS. These are different and must be handled differently:
 
 - **Specific named entity** — a single customer, sales rep, store, or person
   (e.g. "Home Depot", "John Smith", "Walmart"):
-  Select EXACTLY ONE value — the closest match. Do NOT include variants,
-  subsidiaries, or similarly-named entries unless the user explicitly asks for
-  all of them (e.g. "all Home Depot locations"). When choosing between
-  near-duplicates, prefer the shorter/simpler name —
-  "HOME DEPOT" over "HOME DEPOT (HD.COM)".
+  Select EVERY VALUE you see. At least a region or some specification is detailed on
+  the user query. In that case, see which name match better that specification.
 
 - **Category, class, or grouping dimension** — an item class, product category,
   region, segment, etc. (e.g. "imported rugs", "outdoor furniture", "rugs"):

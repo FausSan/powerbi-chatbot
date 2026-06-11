@@ -582,11 +582,14 @@ expression that does not exist in the model (e.g. a custom ratio).
 
 **The right way to use measures**
 
-Use SUMMARIZECOLUMNS to group by columns and pull in measure values:
+Use SUMMARIZECOLUMNS to group by columns and pull in measure values. Whenever the
+measure is monetary, ALSO group by 'W_SHPEXT_F'[CurrencyID] (see the Currency
+rule below):
 
     EVALUATE
         SUMMARIZECOLUMNS(
             'DimCustomer'[CustomerName],
+            'W_SHPEXT_F'[CurrencyID],
             "Net Sales", [Net Sales]
         )
 
@@ -598,6 +601,7 @@ not the measure directly:
         FILTER(
             SUMMARIZECOLUMNS(
                 'DimCustomer'[CustomerName],
+                'W_SHPEXT_F'[CurrencyID],
                 "Net Sales", [Net Sales]
             ),
             [Net Sales] > 0
@@ -624,11 +628,13 @@ WRONG — produces one row per year that exists in the calendar, all with the sa
             "Net Sales", CALCULATE([Net Sales], 'W_CALENDAR_D'[Year] = 2025)
         )
 
-RIGHT — year filter is a top-level FILTER argument, so only 2025 is grouped:
+RIGHT — year filter is a top-level FILTER argument, so only 2025 is grouped, and
+the monetary measure is broken out by currency:
 
     EVALUATE
         SUMMARIZECOLUMNS(
             'W_CALENDAR_D'[Year],
+            'W_SHPEXT_F'[CurrencyID],
             FILTER('W_CALENDAR_D', 'W_CALENDAR_D'[Year] = 2025),
             "Net Sales", [Net Sales]
         )
@@ -647,36 +653,55 @@ unconstrained:
 
     EVALUATE
         ROW(
-            "Net Sales 2025", CALCULATE(
-                [Net Sales],
-                'W_CALENDAR_D'[Year] = 2025,
-                FILTER('W_ICLASS_MBB0REP_D',
-                       'W_ICLASS_MBB0REP_D'[ItemClassDesc] IN {
-                           "Imported Rugs          07",
-                           "Imported Rugs          10",
-                           "Imported Rugs          31"
-                       })
+            "Order Count 2025", CALCULATE(
+                [Order Count],
+                'W_CALENDAR_D'[Year] = 2025
             )
         )
 
-Multi-value single-row comparison ("Q1 2024 vs Q1 2026"):
+CURRENCY EXCEPTION — monetary / sales values are NEVER a single scalar. Because
+sales exist in multiple currencies, a money figure MUST be broken out by
+'W_SHPEXT_F'[CurrencyID]. So for monetary questions, do NOT use ROW(): group by
+'W_SHPEXT_F'[CurrencyID] with SUMMARIZECOLUMNS (one row per currency), passing the
+time/entity/class constraints as top-level FILTER arguments.
+
+Monetary "single value" (net sales 2025 for some item classes), one row per currency:
 
     EVALUATE
-        ROW(
+        SUMMARIZECOLUMNS(
+            'W_SHPEXT_F'[CurrencyID],
+            FILTER('W_CALENDAR_D', 'W_CALENDAR_D'[Year] = 2025),
+            FILTER('W_ICLASS_MBB0REP_D',
+                   'W_ICLASS_MBB0REP_D'[ItemClassDesc] IN {
+                       "Imported Rugs          07",
+                       "Imported Rugs          10",
+                       "Imported Rugs          31"
+                   }),
+            "Net Sales 2025", [Net Sales]
+        )
+
+Monetary multi-period comparison ("Q1 2024 vs Q1 2026"), one row per currency —
+group by CurrencyID, filter the customer at the top level, and let each measure
+apply its own period inside CALCULATE:
+
+    EVALUATE
+        SUMMARIZECOLUMNS(
+            'W_SHPEXT_F'[CurrencyID],
+            FILTER('W_CUST_MBBFREP_D', 'W_CUST_MBBFREP_D'[AlphaSortName] = "WAL-MART STORES"),
             "Q1 2024 Sales", CALCULATE(
                 [Net Sales],
-                FILTER('W_CALENDAR_D', 'W_CALENDAR_D'[Year] = 2024 && 'W_CALENDAR_D'[Quarter] = 1),
-                FILTER('W_CUST_MBBFREP_D', 'W_CUST_MBBFREP_D'[AlphaSortName] = "WAL-MART STORES")
+                FILTER('W_CALENDAR_D', 'W_CALENDAR_D'[Year] = 2024 && 'W_CALENDAR_D'[Quarter] = 1)
             ),
             "Q1 2026 Sales", CALCULATE(
                 [Net Sales],
-                FILTER('W_CALENDAR_D', 'W_CALENDAR_D'[Year] = 2026 && 'W_CALENDAR_D'[Quarter] = 1),
-                FILTER('W_CUST_MBBFREP_D', 'W_CUST_MBBFREP_D'[AlphaSortName] = "WAL-MART STORES")
+                FILTER('W_CALENDAR_D', 'W_CALENDAR_D'[Year] = 2026 && 'W_CALENDAR_D'[Quarter] = 1)
             )
         )
 
 Decision rule:
-  - Result is a fixed set of named scalar values, no breakdown → ROW()
+  - Non-monetary single value, no breakdown → ROW()
+  - ANY monetary / sales value → SUMMARIZECOLUMNS grouped by 'W_SHPEXT_F'[CurrencyID]
+    (plus any other requested dimension), with constraints as top-level FILTER args
   - Result groups by one or more dimension columns → SUMMARIZECOLUMNS,
     with any filter on a grouped column passed as a top-level FILTER argument
 
@@ -725,7 +750,15 @@ CATEGORY / CLASS. These are different and must be handled differently:
 **Year-over-year**
 If a YoY comparison is requested with no explicit time period, compare
 year-to-date (DATESYTD) for the current year vs the same period last year
-using SAMEPERIODLASTYEAR or DATEADD.
+using SAMEPERIODLASTYEAR or DATEADD. The result is still monetary, so keep
+'W_SHPEXT_F'[CurrencyID] in the grouping:
+
+    EVALUATE
+        SUMMARIZECOLUMNS(
+            'W_SHPEXT_F'[CurrencyID],
+            "Sales YTD",     CALCULATE([Net Sales], DATESYTD('W_CALENDAR_D'[Date])),
+            "Sales YTD LY",  CALCULATE([Net Sales], SAMEPERIODLASTYEAR(DATESYTD('W_CALENDAR_D'[Date])))
+        )
 
 **General advice**
 Prefer SUMMARIZECOLUMNS over SUMMARIZE for queries that include measures — it
@@ -734,7 +767,11 @@ ADDCOLUMNS(SUMMARIZE(...)) if you need to add computed columns to an existing
 row set.
 
 **Currency**
-It's mandatory to group money and sales values by CurrencyID from W_SHPEXT_F. It's important because sales values has different currencies. 
+It's mandatory to group money and sales values by CurrencyID from W_SHPEXT_F. It's important because sales values has different currencies.
+Concretely: every query whose result includes a monetary measure (net sales,
+gross sales, credit memos, etc.) MUST include 'W_SHPEXT_F'[CurrencyID] as a
+grouping column, so each currency is reported on its own row. Never sum across
+currencies into a single figure.
 
 **Gross sales**
 When you are asked about gross sales, OrderType_Categorical (from W_SHPEXT_F) should be equal to Customer Orders. 

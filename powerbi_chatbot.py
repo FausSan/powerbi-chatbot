@@ -734,7 +734,7 @@ ADDCOLUMNS(SUMMARIZE(...)) if you need to add computed columns to an existing
 row set.
 
 **Currency**
-ALWAYS group money values by CurrencyID from W_SHPEXT_F.
+It's mandatory to group money and sales values by CurrencyID from W_SHPEXT_F. It's important because sales values has different currencies. 
 
 **Gross sales**
 When you are asked about gross sales, OrderType_Categorical (from W_SHPEXT_F) should be equal to Customer Orders. 

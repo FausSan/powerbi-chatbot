@@ -789,7 +789,7 @@ def render_chat_pane(schema, token):
             question = st.text_input(
                 label="question",
                 label_visibility="collapsed",
-                placeholder="Ask a question…  (press Enter to send)",
+                placeholder="Ask a question…",
                 key="question_input",
             )
         with col_btn:

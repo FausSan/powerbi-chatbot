@@ -734,7 +734,7 @@ ADDCOLUMNS(SUMMARIZE(...)) if you need to add computed columns to an existing
 row set.
 
 **Currency**
-When the question implies a currency, get that CurrencyID from W_SHPEXT_F.
+ALWAYS group money values by CurrencyID from W_SHPEXT_F.
 
 **Gross sales**
 When you are asked about gross sales, OrderType_Categorical (from W_SHPEXT_F) should be equal to Customer Orders. 

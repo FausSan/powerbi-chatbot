@@ -343,6 +343,8 @@ if "device_flow_app" not in st.session_state:
     st.session_state.device_flow_app = None
 if "device_flow_result" not in st.session_state:
     st.session_state.device_flow_result = None
+if "dash_open" not in st.session_state:
+    st.session_state.dash_open = False
 
 
 # ── Ask with metadata ────────────────────────────────────────────────────────
@@ -681,48 +683,85 @@ def render_auth_screen():
 
 
 # ── Power BI dashboard (slide-in modal) ───────────────────────────────────────
-@st.dialog(POWERBI_REPORT_TITLE, width="large")
-def show_dashboard_dialog():
-    if POWERBI_EMBED_URL:
-        components.html(
-            f"""
-            <div style="width:100%; height:800px;">
-              <iframe
-                  title="{POWERBI_REPORT_TITLE}"
-                  src="{POWERBI_EMBED_URL}"
-                  style="border:none; display:block; width:100%; height:800px;"
-                  frameborder="0"
-                  allowFullScreen="true">
-              </iframe>
-            </div>
-            """,
-            height=800,
-            scrolling=False,
-        )
+# ── Power BI dashboard — always mounted, shown/hidden via CSS overlay ──────────
+# Keeping the iframe permanently in the DOM means Power BI stays loaded in the
+# background: closing just hides it, so reopening returns to exactly where you were.
+def render_persistent_dashboard():
+    open_ = st.session_state.dash_open
+
+    # State-dependent CSS. When closed, the panel is parked off-screen (NOT
+    # display:none) so the iframe keeps its loaded state. When open, it becomes a
+    # full-screen overlay.
+    if open_:
+        st.markdown("""
+        <style>
+        .st-key-pbi_dash {
+            position: fixed; inset: 0; width: 100vw; height: 100vh;
+            z-index: 100000; background: #ffffff; padding: 0; margin: 0;
+        }
+        .st-key-pbi_dash iframe { width: 100% !important; height: 100vh !important; border: none !important; }
+        .st-key-pbi_close { position: fixed; top: 12px; right: 20px; z-index: 100001; }
+        .st-key-pbi_close button { box-shadow: 0 2px 10px #1b233022 !important; }
+        </style>
+        """, unsafe_allow_html=True)
     else:
         st.markdown("""
-        <div class="report-placeholder" style="height:420px;">
-            <div style="font-size:40px;margin-bottom:14px;">📊</div>
-            <div style="font-size:15px;color:#1b2330;margin-bottom:8px;">
-                No report URL configured
-            </div>
-            <div style="font-size:12.5px;color:#5a6573;line-height:1.7;max-width:340px;">
-                Set <code style="color:#946d00;">POWERBI_EMBED_URL</code> (env var) or edit the
-                constant at the top of <code style="color:#946d00;">app.py</code> with your
-                report's embed link.
-            </div>
-        </div>
+        <style>
+        .st-key-pbi_dash {
+            position: fixed; left: -99999px; top: 0; width: 1280px; height: 820px;
+            z-index: -1; visibility: hidden;
+        }
+        .st-key-pbi_close { display: none !important; }
+        </style>
         """, unsafe_allow_html=True)
+
+    # Close button — always rendered, hidden by CSS when closed
+    with st.container(key="pbi_close"):
+        if st.button("✕  Cerrar", key="close_dash", type="secondary"):
+            st.session_state.dash_open = False
+            st.rerun()
+
+    # The iframe — ALWAYS rendered at the same position so it is never remounted
+    with st.container(key="pbi_dash"):
+        if POWERBI_EMBED_URL:
+            components.html(
+                f"""
+                <iframe
+                    title="{POWERBI_REPORT_TITLE}"
+                    src="{POWERBI_EMBED_URL}"
+                    style="border:none; display:block; width:100%; height:100vh;"
+                    frameborder="0"
+                    allowFullScreen="true">
+                </iframe>
+                """,
+                height=820,
+                scrolling=False,
+            )
+        else:
+            st.markdown("""
+            <div class="report-placeholder" style="height:420px;">
+                <div style="font-size:40px;margin-bottom:14px;">📊</div>
+                <div style="font-size:15px;color:#1b2330;margin-bottom:8px;">
+                    No report URL configured
+                </div>
+                <div style="font-size:12.5px;color:#5a6573;line-height:1.7;max-width:340px;">
+                    Set <code style="color:#946d00;">POWERBI_EMBED_URL</code> (env var) or edit the
+                    constant at the top of <code style="color:#946d00;">app.py</code> with your
+                    report's embed link.
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
 
 
 # ── Conversation ──────────────────────────────────────────────────────────────
 def render_chat_pane(schema, token):
-    # Dashboard toggle — right-aligned, opens the report in a modal
+    # Dashboard toggle — opens the always-loaded Power BI overlay
     _, btn_col = st.columns([3, 1])
     with btn_col:
         if st.button("📊  Open Dashboard", use_container_width=True, type="secondary",
-                     help="Abrir el dashboard de Power BI"):
-            show_dashboard_dialog()
+                     help="Mostrar el dashboard de Power BI (queda cargado de fondo)"):
+            st.session_state.dash_open = True
+            st.rerun()
 
     # Scrollable history
     history_box = st.container(height=520)
@@ -832,6 +871,10 @@ def render_chat():
     _, mid, _ = st.columns([1, 3, 1])
     with mid:
         render_chat_pane(schema, token)
+
+    # Power BI lives here permanently (loaded in the background), shown as an
+    # overlay when open. Rendered last and always, so it is never remounted.
+    render_persistent_dashboard()
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
